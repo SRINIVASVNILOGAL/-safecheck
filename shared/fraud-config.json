@@ -1,0 +1,34 @@
+{
+  "_comment": "Shared, portable fraud-detection configuration. Per docs/scoring-engine.md Section 5, both the web backend and the Android app should load these identical values rather than each hardcoding their own copy. Update this file (and its checksum/version, informally tracked via git history) rather than editing either platform's code directly.",
+  "version": "2026.09-phase4",
+
+  "brand_domain_map": {
+    "sbi": ["sbi.co.in", "onlinesbi.sbi"],
+    "onlinesbi": ["sbi.co.in", "onlinesbi.sbi"],
+    "yono": ["sbi.co.in", "onlinesbi.sbi"],
+    "hdfc": ["hdfcbank.com"],
+    "hdfcbank": ["hdfcbank.com"],
+    "icici": ["icicibank.com"],
+    "icicibank": ["icicibank.com"],
+    "axis": ["axisbank.com"],
+    "axisbank": ["axisbank.com"],
+    "incometax": ["incometax.gov.in"],
+    "cybercrime": ["cybercrime.gov.in"],
+    "indiapost": ["indiapost.gov.in"],
+    "amazon": ["amazon.in", "amazon.com"],
+    "flipkart": ["flipkart.com"]
+  },
+
+  "high_risk_tlds": [
+    "xyz", "top", "click", "link", "zip", "ru", "surf", "work",
+    "rest", "country", "vip", "fit", "tokyo", "kim", "su", "cfd"
+  ],
+
+  "url_shorteners": [
+    "bit.ly", "tinyurl.com", "t.co", "cutt.ly", "is.gd", "goo.gl",
+    "ow.ly", "rebrand.ly"
+  ],
+
+  "levenshtein_max_distance": 2,
+  "levenshtein_length_window": [-2, 3]
+}
