@@ -124,26 +124,13 @@ class TestEmailSourceType:
         assert "OTP_REQUEST" in signals
 
 
-class TestUrlSourceType:
-    def test_url_without_analyzer_returns_low_with_no_evidence(self) -> None:
-        """No URL analyzer exists yet -- documents current, honest behavior.
-
-        This is not a claim that the URL is safe. It reflects that only
-        the rule engine exists as of this phase; a URL analyzer is a
-        separate, later phase.
-        """
-        response = client.post(
-            "/v1/check",
-            json={
-                "source_type": "URL",
-                "payload": {"url": "https://example.com/login"},
-            },
-        )
-        assert response.status_code == 200
-        body = response.json()
-        assert body["risk"]["score"] == 0
-        assert body["risk"]["band"] == "LOW"
-        assert body["evidence"] == []
+class TestUrlSourceTypeBasicValidation:
+    """URL analysis behavior itself (local heuristics, external providers,
+    combined scoring) is covered by tests/test_api_check_url.py, added
+    once the URL analyzer was built in Phase 4. This class retains only
+    the basic request-validation check that predates and is unrelated to
+    the analyzer's existence.
+    """
 
     def test_missing_url_returns_400(self) -> None:
         response = client.post(

@@ -28,7 +28,23 @@ def generate_explanation(result: RiskResult) -> tuple[str, list[str], str, list[
             [],
         )
 
-    why = [item.reason for item in all_evidence]
+    # Only available evidence describes an actual reason for concern.
+    # Unavailable evidence (a provider check that could not be completed)
+    # is surfaced separately via `uncertainty`, not mixed into `why` --
+    # otherwise "the API key is missing" would misleadingly read as a
+    # fraud signal. Found and fixed during Phase 4 Step 6 live testing.
+    available_evidence = [e for e in all_evidence if e.availability == "available"]
+    why = [item.reason for item in available_evidence]
+
+    if not available_evidence:
+        return (
+            "No signs of fraud were found in the checks that could be completed.",
+            [],
+            "No strong evidence either way. Some checks could not be completed -- verify independently if unsure.",
+            [
+                f"Some checks could not be completed ({', '.join(sorted({e.source for e in all_evidence}))})."
+            ],
+        )
 
     if result.band == "HIGH":
         summary = "This content shows strong signs of being fraudulent."

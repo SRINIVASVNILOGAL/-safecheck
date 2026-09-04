@@ -92,6 +92,47 @@ class TestNormalizeEvidence:
         result = normalize_evidence(evidence, 45)
         assert result[0].points == 5
 
+    def test_zero_point_unavailable_evidence_is_never_rescaled(self) -> None:
+        """Regression test for a real bug found in Phase 4 Step 6.
+
+        When a category's raw evidence exceeds its cap and includes
+        zero-point unavailable evidence alongside real signals, the
+        zero-point items must remain at exactly 0 points. The original
+        implementation used a "minimum 1 point per item" floor across
+        ALL items including zero-point ones, which silently rescaled
+        unavailable evidence to 1 point -- violating the
+        unavailable-must-be-zero-points invariant that Evidence enforces
+        at construction time (but model_copy() does not re-validate).
+        """
+        unavailable = Evidence(
+            category="url",
+            signal="SOME_PROVIDER",
+            points=0,
+            reason="provider down",
+            source="test",
+            availability="unavailable",
+        )
+        real_signals = [
+            make_evidence("url", 25, "A"),
+            make_evidence("url", 10, "B"),
+            make_evidence("url", 10, "C"),
+        ]
+        # Raw sum of real signals (45) exceeds the target (35), forcing
+        # scaling to occur.
+        result = normalize_evidence([*real_signals, unavailable], 35)
+
+        rescaled_unavailable = next(
+            e for e in result if e.signal == "SOME_PROVIDER"
+        )
+        assert rescaled_unavailable.points == 0
+        assert rescaled_unavailable.availability == "unavailable"
+
+        # The real signals should still sum to the target.
+        real_result_points = sum(
+            e.points for e in result if e.signal != "SOME_PROVIDER"
+        )
+        assert real_result_points == 35
+
 
 class TestCalculateRisk:
     def test_no_evidence_yields_zero_low(self) -> None:

@@ -55,36 +55,78 @@ def normalize_evidence(evidence_list: list[Evidence], target_total: int) -> list
     or below the cap, it is left untouched -- we never inflate weak evidence
     to reach a target. Scaling only ever reduces, never increases.
 
-    The returned list's points sum to exactly `target_total` in the common
-    case. KNOWN EDGE CASE: each item has a floor of 1 point (an evidence
-    item that contributed nothing would be meaningless), so if there are
-    more evidence items than `target_total` points available, the sum can
-    exceed `target_total` slightly. This is an inherent limitation of
-    "minimum 1 point per item" normalization, not a bug specific to this
-    implementation -- it is covered by a unit test in Step 3 so the
-    behavior is documented rather than silently wrong.
+    CRITICAL: zero-point evidence (in practice, availability="unavailable"
+    items, per Evidence's own enforced invariant) is NEVER included in the
+    scaling calculation and is always returned unchanged at 0 points. This
+    was discovered as a real bug during Phase 4 Step 6 manual testing:
+    naively scaling every item with a "minimum 1 point" floor caused
+    unavailable evidence to be rescaled to 1 point, silently violating the
+    unavailable-must-be-zero-points invariant (Evidence.model_post_init
+    enforces this at construction time, but model_copy() -- used below to
+    apply scaled points -- does not re-run validation, so the violation
+    was not caught until this function's output was inspected directly).
+
+    The returned list's scalable (points > 0) items sum to exactly
+    `target_total` in the common case. KNOWN EDGE CASE: each scalable item
+    has a floor of 1 point (an evidence item that still contributes
+    something would otherwise be meaningless), so if there are more
+    scalable items than `target_total` points available, their sum can
+    exceed `target_total` slightly. This is covered by a unit test.
     """
-    if not evidence_list or target_total <= 0:
+    if not evidence_list:
         return []
 
     raw_sum = sum(item.points for item in evidence_list)
+
+    if raw_sum == 0:
+        # Every item already has 0 points (e.g. a category containing
+        # only unavailable provider evidence, where target_total is
+        # derived as min(raw_points, cap) = 0). Return unchanged rather
+        # than discarding -- silently dropping "we checked but this was
+        # unavailable" evidence defeats the purpose of that state. This
+        # was a real bug found during Phase 4 Step 6 API-level testing.
+        return evidence_list
+
+    if target_total <= 0:
+        # raw_sum > 0 but the caller asked to scale everything down to
+        # (or below) zero. This does not occur via the real call site
+        # (_score_category always derives target_total = min(raw_points,
+        # cap), and cap is always positive, so target_total can only be
+        # 0 when raw_sum is also 0, handled above). Treated as "scale
+        # everything out" for callers that pass this combination
+        # directly.
+        return []
+
     if raw_sum <= target_total:
         return evidence_list
 
-    scaled: list[Evidence] = []
-    for item in evidence_list:
-        scaled_points = max(1, int((item.points / raw_sum) * target_total))
-        scaled.append(item.model_copy(update={"points": scaled_points}))
+    scalable_items = [item for item in evidence_list if item.points > 0]
+    if not scalable_items:
+        # Every item is zero-point (e.g. all providers unavailable).
+        # Nothing to scale; return unchanged.
+        return evidence_list
 
-    current_sum = sum(item.points for item in scaled)
-    diff = target_total - current_sum
-    if diff != 0:
-        last = scaled[-1]
-        scaled[-1] = last.model_copy(
-            update={"points": max(1, last.points + diff)}
+    scalable_raw_sum = sum(item.points for item in scalable_items)
+    scaled_points_by_id: dict[str, int] = {}
+    for item in scalable_items:
+        scaled_points_by_id[item.evidence_id] = max(
+            1, int((item.points / scalable_raw_sum) * target_total)
         )
 
-    return scaled
+    current_sum = sum(scaled_points_by_id.values())
+    diff = target_total - current_sum
+    if diff != 0:
+        last_id = scalable_items[-1].evidence_id
+        scaled_points_by_id[last_id] = max(
+            1, scaled_points_by_id[last_id] + diff
+        )
+
+    return [
+        item.model_copy(update={"points": scaled_points_by_id[item.evidence_id]})
+        if item.evidence_id in scaled_points_by_id
+        else item  # zero-point items pass through completely untouched
+        for item in evidence_list
+    ]
 
 
 class CategoryBreakdown(BaseModel):
