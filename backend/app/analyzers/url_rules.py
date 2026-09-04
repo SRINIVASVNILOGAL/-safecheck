@@ -28,6 +28,7 @@ import Levenshtein
 
 from app.analyzers.url_config import (
     get_brand_domain_map,
+    get_high_risk_tlds,
     get_levenshtein_length_window,
     get_levenshtein_max_distance,
 )
@@ -36,6 +37,9 @@ from app.risk.evidence import Evidence
 
 LOOKALIKE_POINTS = 25
 TYPOSQUATTING_POINTS = 25
+INSECURE_HTTP_POINTS = 10
+IP_HOSTNAME_POINTS = 15
+HIGH_RISK_TLD_POINTS = 10
 
 
 def _is_official_or_subdomain_of(registered_domain: str, official_domains: list[str]) -> bool:
@@ -153,3 +157,90 @@ def detect_typosquatting(parsed: ParsedUrl) -> Evidence | None:
             )
 
     return None
+
+
+def detect_insecure_http(parsed: ParsedUrl) -> Evidence | None:
+    """Plain HTTP (not HTTPS) is a weak, corroborating signal on its own."""
+    if parsed.scheme != "http":
+        return None
+    return Evidence(
+        category="url",
+        signal="INSECURE_HTTP",
+        points=INSECURE_HTTP_POINTS,
+        reason="The URL uses unencrypted HTTP instead of HTTPS.",
+        observed_value=parsed.scheme,
+        source="url_analyzer",
+        correlation_group="CORR_TRANSPORT",
+        confidence=0.6,
+        severity="LOW",
+    )
+
+
+def detect_ip_hostname(parsed: ParsedUrl) -> Evidence | None:
+    """A bare IP address as a hostname is unusual for legitimate sites."""
+    if not parsed.is_ip_hostname:
+        return None
+    return Evidence(
+        category="url",
+        signal="IP_HOSTNAME",
+        points=IP_HOSTNAME_POINTS,
+        reason="The URL uses a raw IP address instead of a domain name.",
+        observed_value=parsed.full_host,
+        source="url_analyzer",
+        correlation_group="CORR_STRUCTURE",
+        confidence=0.7,
+        severity="MEDIUM",
+    )
+
+
+def detect_high_risk_tld(parsed: ParsedUrl) -> Evidence | None:
+    """A high-risk TLD alone is a weak signal -- many legitimate sites use them."""
+    if not parsed.suffix:
+        return None
+    # suffix can be multi-label (e.g. "co.in"); only the final label is
+    # the actual TLD we check against the high-risk list.
+    tld = parsed.suffix.rsplit(".", maxsplit=1)[-1]
+    if tld not in get_high_risk_tlds():
+        return None
+    return Evidence(
+        category="url",
+        signal="HIGH_RISK_TLD",
+        points=HIGH_RISK_TLD_POINTS,
+        reason=f"The domain uses a top-level domain ('.{tld}') commonly associated with abuse.",
+        observed_value=f".{tld}",
+        source="url_analyzer",
+        correlation_group="CORR_STRUCTURE",
+        confidence=0.5,
+        severity="LOW",
+    )
+
+
+def run_local_url_checks(parsed: ParsedUrl) -> list[Evidence]:
+    """Run every local (non-network) URL rule and collect the evidence.
+
+    This is the single entry point the URL analyzer's HTTP-request-facing
+    code should call for local checks. External provider checks (Google
+    Safe Browsing, VirusTotal -- Steps 4-5) are separate and combined with
+    this list at the call site (Step 6), since they involve network I/O
+    and must be handled independently for availability.
+
+    Lookalike and typosquatting detection are mutually exclusive per the
+    Step 2 design: typosquatting is only checked if no lookalike match was
+    found, to avoid double-counting the same underlying deception.
+    """
+    evidence: list[Evidence] = []
+
+    lookalike = detect_lookalike_domain(parsed)
+    if lookalike is not None:
+        evidence.append(lookalike)
+    else:
+        typosquat = detect_typosquatting(parsed)
+        if typosquat is not None:
+            evidence.append(typosquat)
+
+    for check in (detect_insecure_http, detect_ip_hostname, detect_high_risk_tld):
+        result = check(parsed)
+        if result is not None:
+            evidence.append(result)
+
+    return evidence
