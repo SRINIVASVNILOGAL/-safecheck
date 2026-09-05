@@ -16,7 +16,10 @@ from app.integrations.virustotal import check_url_virustotal
 from app.risk.engine import calculate_risk
 from app.risk.evidence import Evidence
 from app.risk.rules import run_all_rules
-from app.services.explanation import generate_explanation, generate_safe_actions
+from app.services.explanation import (
+    generate_safe_actions,
+    generate_user_facing_explanation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,5 +108,13 @@ async def score_risk(state: GraphState) -> dict:
 
 
 async def build_explanation(state: GraphState) -> dict:
-    summary, why, next_action, uncertainty = generate_explanation(state["risk_result"])
-    return {"summary": summary, "why": why, "next_action": next_action, "uncertainty": uncertainty, "safe_actions": generate_safe_actions(state["risk_result"])}
+    summary, why, next_action, uncertainty = await generate_user_facing_explanation(
+        state["risk_result"]
+    )
+    return {
+        "summary": summary,
+        "why": why,
+        "next_action": next_action,
+        "uncertainty": uncertainty,
+        "safe_actions": generate_safe_actions(state["risk_result"]),
+    }

@@ -207,6 +207,12 @@ Multiple flags may fire; their points sum and are then capped at 20 via the norm
 
 The backend validates this shape (e.g. with Pydantic) before converting flags to evidence. If the LLM fails, times out, or returns an invalid shape, `ML_points = 0` with an `unavailable` evidence entry — the case still proceeds using Rule_points and URL_points alone.
 
+### 7.3 OpenRouter explanation wording
+
+OpenRouter is currently used only after the deterministic engine has already produced the final score, risk band, and evidence. It may return a validated `summary` and `next_action` to make the result easier to understand; it does not create Evidence or participate in scoring.
+
+The explanation request is intentionally privacy-minimized: it includes only the final score/band and a bounded list of available signal codes, categories, severities, and points. It excludes submitted text, email sender/headers, attachment contents, URLs, observed values, and secrets. If OpenRouter is missing, times out, fails, or returns invalid JSON, SafeCheck returns the existing deterministic explanation without failing the case.
+
 ## 8. Relationship to `docs/api-contract.md`
 
 `docs/api-contract.md` has been updated so that `risk.band` documents all four values (`LOW`, `UNCERTAIN`, `MEDIUM`, `HIGH`) instead of the original three-band draft. The `evidence[]` array in API responses should use the richer schema from Section 4 of this document (adding `category`, `correlationGroup`, `severity` alongside the fields already specified in the API contract).

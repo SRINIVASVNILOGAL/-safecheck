@@ -13,7 +13,12 @@ failure for the risk result itself.
 
 from __future__ import annotations
 
+import logging
+
+from app.integrations.openrouter import generate_openrouter_explanation
 from app.risk.engine import RiskResult
+
+logger = logging.getLogger(__name__)
 
 
 def generate_explanation(result: RiskResult) -> tuple[str, list[str], str, list[str]]:
@@ -86,3 +91,30 @@ def generate_safe_actions(result: RiskResult) -> list[str]:
             "Verify the sender or organization independently before acting.",
         ]
     return []
+
+
+async def generate_user_facing_explanation(
+    result: RiskResult,
+) -> tuple[str, list[str], str, list[str]]:
+    """Return optional OpenRouter wording with a deterministic fallback.
+
+    This function runs strictly after ``calculate_risk``. It preserves the
+    deterministic ``why`` and ``uncertainty`` lists and never changes the
+    evidence, score, risk band, or safe actions. Cases with no available
+    findings do not need an external wording request.
+    """
+    fallback = generate_explanation(result)
+    if not any(item.availability == "available" for item in result.all_evidence):
+        return fallback
+
+    try:
+        generated = await generate_openrouter_explanation(result)
+    except Exception as exc:  # noqa: BLE001 - explanation must never block a case
+        logger.warning("OpenRouter explanation fallback: %s", exc.__class__.__name__)
+        return fallback
+
+    if generated is None:
+        return fallback
+
+    _, why, _, uncertainty = fallback
+    return generated.summary, why, generated.next_action, uncertainty

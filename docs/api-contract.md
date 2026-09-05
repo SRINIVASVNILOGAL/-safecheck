@@ -113,7 +113,7 @@ Note: `POST /v1/check` handles text-based input only. Document/file input has it
 | `risk.band` | string enum | `LOW` (0–24), `UNCERTAIN` (25–39), `MEDIUM` (40–74), `HIGH` (75–100) — derived, never set independently. Matches the shared Android scoring contract |
 | `evidence` | array | Each item must include `signal`, `points`, `reason`, `source`, `confidence`, `availability`, plus `category` (`rules`\|`url`\|`ml`), `correlationGroup`, and `severity` per `docs/scoring-engine.md` |
 | `evidence[].availability` | string enum | `available` or `unavailable` — an unavailable provider must contribute 0 points, never treated as malicious |
-| `explanation.summary` | string | Plain-language summary, produced by LLM but must not alter `risk.score` |
+| `explanation.summary` | string | Plain-language wording from OpenRouter when available; otherwise deterministic fallback. It is generated only after scoring and cannot alter `risk.score`, `risk.band`, evidence, or safe actions. Raw submitted text, sender data, attachment contents, and URLs are not sent to the explanation provider. |
 | `explanation.uncertainty` | array | Notes about unavailable checks or low-confidence findings |
 | `safe_actions` | array of strings | User-facing recommended next steps |
 | `created_at` | string | ISO 8601 UTC timestamp |
