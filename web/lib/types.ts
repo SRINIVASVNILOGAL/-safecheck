@@ -62,6 +62,30 @@ export interface CheckResponse {
   created_at: string;
 }
 
+/** Gmail on-demand polling API contracts (backend/app/models/email.py). */
+export interface EmailStatusResponse {
+  connected: boolean;
+  email_address: string | null;
+  last_checked_at: string | null;
+}
+
+export interface ConnectStartResponse {
+  authorization_url: string;
+}
+
+export interface CheckedMessage {
+  message_id: string;
+  from: string;
+  subject: string;
+  received_at: string;
+  check: CheckResponse;
+}
+
+export interface CheckNowResponse {
+  checked_count: number;
+  results: CheckedMessage[];
+}
+
 /** Shape of a FastAPI HTTPException error body, e.g. {"detail": "..."} */
 export interface ApiErrorBody {
   detail?: string | { msg: string }[];

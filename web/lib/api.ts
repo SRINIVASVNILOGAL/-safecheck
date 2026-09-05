@@ -1,4 +1,11 @@
-import type { ApiErrorBody, CheckRequest, CheckResponse } from "./types";
+import type {
+  ApiErrorBody,
+  CheckNowResponse,
+  CheckRequest,
+  CheckResponse,
+  ConnectStartResponse,
+  EmailStatusResponse,
+} from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
 
@@ -92,4 +99,53 @@ export async function checkHealth(): Promise<{ status: string }> {
     throw new ApiError(response.status, "Backend health check failed.");
   }
   return response.json();
+}
+
+/** GET /v1/email/status -- reports the connected Gmail account, if any. */
+export async function getEmailStatus(): Promise<EmailStatusResponse> {
+  const response = await fetch(`${API_URL}/v1/email/status`);
+  const body = await parseJsonSafely(response);
+
+  if (!response.ok) {
+    throw new ApiError(
+      response.status,
+      extractErrorMessage(body, `Request failed with status ${response.status}`)
+    );
+  }
+
+  return body as EmailStatusResponse;
+}
+
+/** POST /v1/email/connect/start -- returns the Google OAuth consent URL. */
+export async function startEmailConnect(): Promise<ConnectStartResponse> {
+  const response = await fetch(`${API_URL}/v1/email/connect/start`, {
+    method: "POST",
+  });
+  const body = await parseJsonSafely(response);
+
+  if (!response.ok) {
+    throw new ApiError(
+      response.status,
+      extractErrorMessage(body, `Request failed with status ${response.status}`)
+    );
+  }
+
+  return body as ConnectStartResponse;
+}
+
+/** POST /v1/email/check-now -- fetches and analyzes the recent inbox batch. */
+export async function checkEmailNow(): Promise<CheckNowResponse> {
+  const response = await fetch(`${API_URL}/v1/email/check-now`, {
+    method: "POST",
+  });
+  const body = await parseJsonSafely(response);
+
+  if (!response.ok) {
+    throw new ApiError(
+      response.status,
+      extractErrorMessage(body, `Request failed with status ${response.status}`)
+    );
+  }
+
+  return body as CheckNowResponse;
 }

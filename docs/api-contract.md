@@ -241,14 +241,89 @@ Unchanged from Phase 1.
 }
 ```
 
+## Gmail integration (Phase 9)
+
+On-demand polling only, no background scheduler. The user explicitly
+connects a Gmail account via OAuth, then explicitly triggers a check via
+"Check now" in the UI. There is no automatic/scheduled polling in this
+phase.
+
+Scope requested: `https://www.googleapis.com/auth/gmail.readonly` only.
+SafeCheck never sends, modifies, or deletes email.
+
+### Endpoint: GET /v1/email/status
+
+Whether a Gmail account is currently connected, and when it was last checked.
+
+```json
+{
+  "connected": true,
+  "email_address": "user@gmail.com",
+  "last_checked_at": "2026-09-05T10:00:00+00:00"
+}
+```
+
+If no account is connected: `{"connected": false, "email_address": null, "last_checked_at": null}`.
+
+### Endpoint: POST /v1/email/connect/start
+
+Starts the OAuth flow. Returns a Google consent URL the frontend redirects the user's browser to.
+
+Response:
+```json
+{ "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?..." }
+```
+
+### Endpoint: GET /v1/email/connect/callback
+
+Google redirects here after the user grants (or denies) consent, with
+`code` and `state` query parameters. Exchanges `code` for tokens via
+Google's token endpoint, persists the refresh token, then redirects the
+browser back to the frontend (`FRONTEND_URL` + `/email?connected=true`,
+or `?connected=false&reason=...` on failure/denial).
+
+This endpoint is not meant to be called directly by frontend JS -- it is
+the OAuth redirect target, hit by the browser navigating away from
+Google.
+
+### Endpoint: POST /v1/email/check-now
+
+Fetches recent messages from the connected Gmail account (up to a fixed
+batch size, most recent first) and runs each through the same pipeline as
+`POST /v1/check` with `source_type=EMAIL`. Returns one `CheckResponse`
+per message, plus the Gmail message id and basic headers so the frontend
+can display which email each result belongs to.
+
+Request: empty body.
+
+Response:
+```json
+{
+  "checked_count": 3,
+  "results": [
+    {
+      "message_id": "18c9f2a1b3d4e5f6",
+      "from": "support@example.com",
+      "subject": "Your account will be suspended",
+      "received_at": "2026-09-05T09:55:00+00:00",
+      "check": { "...": "same shape as POST /v1/check response" }
+    }
+  ]
+}
+```
+
+Error responses:
+
+| Status | Meaning |
+|---|---|
+| 400 | No Gmail account is connected. Client should call `/v1/email/connect/start` first. |
+| 401 | Stored token is invalid/revoked (e.g. user revoked access from their Google account). Client should re-connect. |
+| 502 | Gmail API returned an unexpected error. |
+
 ## Endpoints planned for later phases
 
 ```text
 GET  /v1/cases/{case_id}
-GET  /v1/email/status
-POST /v1/email/connect/start
-GET  /v1/email/connect/callback
-POST /v1/email/check-now
 POST /v1/safety-circle/review
 GET  /v1/safety-circle/review/{token}
 POST /v1/safety-circle/review/{token}/response
