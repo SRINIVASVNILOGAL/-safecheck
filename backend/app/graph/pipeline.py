@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from langgraph.graph import END, StateGraph
 
 from app.graph.nodes import build_explanation, classify_input, extract_evidence, score_risk
-from app.graph.state import GraphState
+from app.graph.state import EmailAttachment, GraphState
 from app.models.check import CheckPayload
 from app.risk.engine import RiskResult
 
@@ -96,6 +96,27 @@ async def run_check_pipeline(
     }
     final_state = await compiled_graph.ainvoke(initial_state)
     return _to_pipeline_result(final_state)
+
+
+async def run_email_pipeline(
+    payload: CheckPayload,
+    *,
+    urls: list[str],
+    attachments: list[EmailAttachment],
+) -> PipelineResult:
+    """Entry point for Gmail-fetched messages.
+
+    The Email Agent supplies bounded URLs and attachment bytes. The graph
+    gathers all resulting evidence and calls the deterministic risk engine
+    once; it never aggregates independently-finalized child scores.
+    """
+    initial_state: GraphState = {
+        "source_type": "EMAIL",
+        "payload": payload,
+        "email_urls": urls,
+        "email_attachments": attachments,
+    }
+    return _to_pipeline_result(await compiled_graph.ainvoke(initial_state))
 
 
 async def run_document_pipeline(

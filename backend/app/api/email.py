@@ -25,7 +25,7 @@ from fastapi.responses import RedirectResponse
 from app.api.check import build_check_response_from_result
 from app.config import settings
 from app.db import get_gmail_account, update_last_checked_at, upsert_gmail_account
-from app.graph.pipeline import run_check_pipeline
+from app.graph.pipeline import run_email_pipeline
 from app.integrations.gmail import (
     GmailApiError,
     build_authorization_url,
@@ -34,10 +34,12 @@ from app.integrations.gmail import (
 )
 from app.models.check import CheckPayload
 from app.models.email import (
+    AnalysisCoverage,
     CheckedMessage,
     CheckNowResponse,
     ConnectStartResponse,
     EmailStatusResponse,
+    SkippedAttachmentOut,
 )
 
 router = APIRouter()
@@ -152,7 +154,11 @@ async def check_now() -> CheckNowResponse:
             subject=message.subject,
             body=message.body.strip() or "(no text content)",
         )
-        pipeline_result = await run_check_pipeline("EMAIL", payload)
+        pipeline_result = await run_email_pipeline(
+            payload,
+            urls=list(message.urls),
+            attachments=list(message.attachments),
+        )
         check_response = build_check_response_from_result(
             case_id=f"case_{uuid4().hex[:8]}",
             source_type="EMAIL",
@@ -164,6 +170,16 @@ async def check_now() -> CheckNowResponse:
                 from_=message.sender,
                 subject=message.subject,
                 received_at=message.received_at,
+                analysis_coverage=AnalysisCoverage(
+                    urls_found=message.urls_found,
+                    urls_analyzed=len(message.urls),
+                    attachments_found=message.attachments_found,
+                    attachments_analyzed=len(message.attachments),
+                    skipped_attachments=[
+                        SkippedAttachmentOut(filename=item.filename, reason=item.reason)
+                        for item in message.skipped_attachments
+                    ],
+                ),
                 check=check_response,
             )
         )

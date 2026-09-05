@@ -73,11 +73,25 @@ export interface ConnectStartResponse {
   authorization_url: string;
 }
 
+export interface SkippedAttachment {
+  filename: string;
+  reason: string;
+}
+
+export interface AnalysisCoverage {
+  urls_found: number;
+  urls_analyzed: number;
+  attachments_found: number;
+  attachments_analyzed: number;
+  skipped_attachments: SkippedAttachment[];
+}
+
 export interface CheckedMessage {
   message_id: string;
   from: string;
   subject: string;
   received_at: string;
+  analysis_coverage: AnalysisCoverage;
   check: CheckResponse;
 }
 

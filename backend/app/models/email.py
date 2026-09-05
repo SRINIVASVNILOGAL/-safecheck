@@ -20,6 +20,19 @@ class ConnectStartResponse(BaseModel):
     authorization_url: str
 
 
+class AnalysisCoverage(BaseModel):
+    urls_found: int = 0
+    urls_analyzed: int = 0
+    attachments_found: int = 0
+    attachments_analyzed: int = 0
+    skipped_attachments: list["SkippedAttachmentOut"] = Field(default_factory=list)
+
+
+class SkippedAttachmentOut(BaseModel):
+    filename: str
+    reason: str
+
+
 class CheckedMessage(BaseModel):
     message_id: str
     # Gmail's own header is "From"; `from` is a reserved word in Python,
@@ -28,6 +41,7 @@ class CheckedMessage(BaseModel):
     from_: str = Field(serialization_alias="from")
     subject: str
     received_at: str
+    analysis_coverage: AnalysisCoverage = Field(default_factory=AnalysisCoverage)
     check: CheckResponse
 
     model_config = ConfigDict(populate_by_name=True)

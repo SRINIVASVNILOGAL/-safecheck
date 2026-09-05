@@ -289,10 +289,26 @@ Google.
 ### Endpoint: POST /v1/email/check-now
 
 Fetches recent messages from the connected Gmail account (up to a fixed
-batch size, most recent first) and runs each through the same pipeline as
-`POST /v1/check` with `source_type=EMAIL`. Returns one `CheckResponse`
-per message, plus the Gmail message id and basic headers so the frontend
-can display which email each result belongs to.
+batch size, most recent first). Each message is analyzed by the Email
+Agent as one combined case:
+
+```text
+email subject/body rules
++ every canonical embedded HTTP(S) URL (local URL heuristics + Google Safe Browsing + VirusTotal)
++ supported Gmail attachments (PDF/PNG/JPEG text extraction + document/message rules)
+→ one deterministic risk-engine calculation
+```
+
+The system **does not** compute separate final scores and add them. All
+raw Evidence is merged first and scored exactly once, preserving the
+shared category caps: rules ≤45, URL ≤35, ML ≤20.
+
+Safety limits per message: at most 5 canonical URLs, 3 supported
+attachments, 5 MB per attachment, and 10 MB total downloaded attachment
+bytes. URL values over the limit and unsupported/oversize/unreadable
+attachments are skipped and reported in `analysis_coverage`; they never
+produce positive fraud points. Supported content types are
+`application/pdf`, `image/png`, and `image/jpeg`.
 
 Request: empty body.
 
@@ -306,11 +322,25 @@ Response:
       "from": "support@example.com",
       "subject": "Your account will be suspended",
       "received_at": "2026-09-05T09:55:00+00:00",
+      "analysis_coverage": {
+        "urls_found": 2,
+        "urls_analyzed": 2,
+        "attachments_found": 1,
+        "attachments_analyzed": 1,
+        "skipped_attachments": []
+      },
       "check": { "...": "same shape as POST /v1/check response" }
     }
   ]
 }
 ```
+
+`analysis_coverage` contains metadata only; neither attachment bytes nor
+attachment text is returned. `skipped_attachments` entries have the
+shape `{"filename":"invoice.exe","reason":"Unsupported attachment type."}`.
+Text-extraction failures are additionally surfaced through the normal
+zero-point unavailable Evidence/uncertainty path, so an unreadable PDF
+is never presented as clean.
 
 Error responses:
 

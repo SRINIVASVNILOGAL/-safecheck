@@ -3,56 +3,58 @@
 LangGraph nodes receive the full state dict and return a partial dict of
 updates to merge in. This TypedDict is the contract between nodes -- every
 node reads from it and/or writes to it via these exact keys.
-
-Design note: `evidence` is declared with `operator.add` as its reducer so
-that if extract_evidence ever fans out into multiple parallel branches
-(e.g. Phase 8 adding an LLM-evidence node alongside the existing
-rule/URL/document extraction), LangGraph will concatenate each branch's
-evidence list automatically instead of the last writer overwriting the
-others. Today extract_evidence is a single node that already gathers
-everything concurrently internally (mirroring the original
-asyncio.gather in app.api.check._analyze_url), so this only matters once
-Phase 8 splits it into multiple graph nodes.
 """
 
 from __future__ import annotations
 
 import operator
+from dataclasses import dataclass
 from typing import Annotated, Literal, TypedDict
 
-from app.models.check import CheckPayload, SourceType
+from app.models.check import CheckPayload
 from app.risk.evidence import Evidence
 from app.risk.engine import RiskResult
 
-# The graph supports one more source_type than the /v1/check request body
-# does: "DOCUMENT", used only when invoked from POST /v1/document, where
-# extraction has already happened before the graph runs (see
-# app.graph.pipeline.run_document_pipeline).
 GraphSourceType = Literal["TEXT", "URL", "EMAIL", "DOCUMENT"]
+
+
+@dataclass(frozen=True)
+class EmailAttachment:
+    """A supported Gmail attachment already downloaded under the Email
+    Agent's strict resource limits. Its bytes are graph input only and are
+    never returned by the email API response.
+    """
+
+    filename: str
+    content_type: str
+    data: bytes
 
 
 class GraphState(TypedDict, total=False):
     """Pipeline state. `total=False` since nodes populate fields
-    progressively as the graph runs -- not every field is present at
-    every step.
+    progressively as the graph runs -- not every field is present at every
+    step.
     """
 
     # ---- Inputs (set before graph.ainvoke) ----
     source_type: GraphSourceType
     payload: CheckPayload | None
+
+    # Gmail-only fan-out inputs. The Email Agent extracts/limits these
+    # before the graph is invoked, then extract_evidence merges their
+    # evidence with email-text evidence before the single score_risk node.
+    email_urls: list[str]
+    email_attachments: list[EmailAttachment]
+
     # Only used for the DOCUMENT branch: pre-extracted text and whether
-    # extraction itself succeeded. POST /v1/document performs file
-    # extraction (pypdf/pytesseract) before invoking the graph, since
-    # that is an I/O-bound file-parsing step, not an evidence-gathering
-    # step -- the graph's job starts once there is text (or a known
-    # extraction failure) to analyze.
+    # extraction itself succeeded.
     document_text: str | None
     document_extraction_ok: bool
     document_extraction_reason: str | None
     document_truncated: bool
 
     # ---- Intermediate (set by classify_input) ----
-    analysis_text: str | None  # resolved TEXT/EMAIL text to run rules on
+    analysis_text: str | None
 
     # ---- Output of extract_evidence ----
     evidence: Annotated[list[Evidence], operator.add]

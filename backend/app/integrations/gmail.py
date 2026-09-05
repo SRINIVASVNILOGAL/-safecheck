@@ -1,23 +1,9 @@
-"""Gmail OAuth flow and message-fetching adapter.
+"""Gmail OAuth, bounded MIME extraction, and message fetching.
 
-Scope requested: gmail.readonly ONLY. This module never sends, modifies,
-labels, or deletes any email -- it only lists and reads message content
-for analysis. See docs/api-contract.md's "Gmail integration (Phase 9)"
-section for the full endpoint contract this supports.
-
-Design notes:
-- All Google API calls use httpx directly (async, consistent with the
-  rest of the codebase's provider adapters -- google_safe_browsing.py,
-  virustotal.py) rather than the synchronous googleapiclient library,
-  even though that library is already a dependency (installed for a
-  possible future admin/verification use, currently unused elsewhere).
-- Errors are raised as GmailApiError (a plain exception, not converted
-  to Evidence) since this module operates one layer below the risk
-  engine -- app.api.email is responsible for translating failures here
-  into the HTTP error responses documented in the API contract (400,
-  401, 502).
+Gmail remains read-only. The Email Agent extracts plain/HTML text, canonical
+HTTP(S) URLs, and a bounded set of supported attachment bytes. It never
+returns attachment contents or sends/modifies Gmail messages.
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -26,60 +12,35 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import httpx
 
 from app.config import settings
+from app.graph.state import EmailAttachment
 
 _AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 _TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 _GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
-
-# Read-only scope only, per the API contract. openid/email/profile are
-# included so we can identify which Gmail address was connected (shown
-# in GET /v1/email/status) without needing a second consent screen.
-_SCOPES = (
-    "https://www.googleapis.com/auth/gmail.readonly "
-    "openid email"
-)
-
-# How many of the most recent messages check-now fetches per call.
+_SCOPES = "https://www.googleapis.com/auth/gmail.readonly openid email"
 MESSAGE_BATCH_SIZE = 10
-
+MAX_EMAIL_URLS = 5
+MAX_EMAIL_ATTACHMENTS = 3
+MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
+MAX_TOTAL_ATTACHMENT_BYTES = 10 * 1024 * 1024
+_SUPPORTED_ATTACHMENT_TYPES = {"application/pdf", "image/png", "image/jpeg"}
 _DEFAULT_TIMEOUT_SECONDS = 10.0
+_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
 
 class GmailApiError(Exception):
-    """Raised for any Gmail/OAuth API failure. Carries enough information
-    for app.api.email to pick the right HTTP status code.
-    """
-
     def __init__(self, message: str, *, invalid_grant: bool = False) -> None:
         super().__init__(message)
         self.invalid_grant = invalid_grant
 
 
 def build_authorization_url(state: str) -> str:
-    """Build the Google OAuth consent URL the frontend redirects to.
-
-    access_type=offline + prompt=consent ensures Google issues a refresh
-    token even if the user has previously granted consent (Google only
-    issues a refresh token on the *first* consent grant by default,
-    which would silently break reconnect-after-revoke without
-    prompt=consent forcing it every time).
-    """
-    params = {
-        "client_id": settings.google_client_id,
-        "redirect_uri": settings.gmail_redirect_uri,
-        "response_type": "code",
-        "scope": _SCOPES,
-        "access_type": "offline",
-        "prompt": "consent",
-        "state": state,
-    }
-    query = urlencode(params)
-    return f"{_AUTH_ENDPOINT}?{query}"
+    return f"{_AUTH_ENDPOINT}?{urlencode({'client_id': settings.google_client_id, 'redirect_uri': settings.gmail_redirect_uri, 'response_type': 'code', 'scope': _SCOPES, 'access_type': 'offline', 'prompt': 'consent', 'state': state})}"
 
 
 @dataclass(frozen=True)
@@ -88,105 +49,48 @@ class TokenExchangeResult:
     email_address: str
 
 
-async def exchange_code_for_tokens(
-    code: str, http_client: httpx.AsyncClient | None = None
-) -> TokenExchangeResult:
-    """Exchange an OAuth authorization code for a refresh token, and
-    resolve the connected account's email address.
-
-    Raises GmailApiError if the exchange fails (e.g. the code was
-    already used, expired, or the user denied consent upstream -- the
-    latter is handled by app.api.email checking for an `error` query
-    param before this is ever called).
-
-    http_client: optional injected httpx.AsyncClient, for testing
-        without real network calls (see google_safe_browsing.py /
-        virustotal.py for the same pattern).
-    """
-    owns_client = http_client is None
+async def exchange_code_for_tokens(code: str, http_client: httpx.AsyncClient | None = None) -> TokenExchangeResult:
+    owns = http_client is None
     client = http_client or httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT_SECONDS)
     try:
-        response = await client.post(
-            _TOKEN_ENDPOINT,
-            data={
-                "code": code,
-                "client_id": settings.google_client_id,
-                "client_secret": settings.google_client_secret,
-                "redirect_uri": settings.gmail_redirect_uri,
-                "grant_type": "authorization_code",
-            },
-        )
+        response = await client.post(_TOKEN_ENDPOINT, data={"code": code, "client_id": settings.google_client_id, "client_secret": settings.google_client_secret, "redirect_uri": settings.gmail_redirect_uri, "grant_type": "authorization_code"})
         if response.status_code != 200:
-            raise GmailApiError(
-                f"Token exchange failed: HTTP {response.status_code} {response.text}"
-            )
+            raise GmailApiError(f"Token exchange failed: HTTP {response.status_code} {response.text}")
         body = response.json()
-        refresh_token = body.get("refresh_token")
-        access_token = body.get("access_token")
+        refresh_token, access_token = body.get("refresh_token"), body.get("access_token")
         if not refresh_token:
-            # Happens if prompt=consent was somehow bypassed on a repeat
-            # grant. Surface a clear, actionable error rather than
-            # storing an empty token that would fail silently later.
-            raise GmailApiError(
-                "Google did not return a refresh token. Try disconnecting "
-                "SafeCheck's access in your Google Account settings and "
-                "connecting again."
-            )
-
-        userinfo_response = await client.get(
-            "https://www.googleapis.com/oauth2/v2/userinfo",
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        if userinfo_response.status_code != 200:
-            raise GmailApiError(
-                f"Failed to resolve connected account email: "
-                f"HTTP {userinfo_response.status_code}"
-            )
-        email_address = userinfo_response.json().get("email", "")
+            raise GmailApiError("Google did not return a refresh token. Try disconnecting SafeCheck's access in your Google Account settings and connecting again.")
+        userinfo = await client.get("https://www.googleapis.com/oauth2/v2/userinfo", headers={"Authorization": f"Bearer {access_token}"})
+        if userinfo.status_code != 200:
+            raise GmailApiError(f"Failed to resolve connected account email: HTTP {userinfo.status_code}")
+        return TokenExchangeResult(refresh_token=refresh_token, email_address=userinfo.json().get("email", ""))
     finally:
-        if owns_client:
+        if owns:
             await client.aclose()
 
-    return TokenExchangeResult(refresh_token=refresh_token, email_address=email_address)
 
-
-async def _get_access_token(
-    refresh_token: str, http_client: httpx.AsyncClient | None = None
-) -> str:
-    """Exchange a stored refresh token for a short-lived access token.
-
-    Raises GmailApiError(invalid_grant=True) if the refresh token itself
-    has been revoked (e.g. the user removed SafeCheck's access from
-    their Google Account) -- app.api.email maps this to HTTP 401 so the
-    frontend knows to prompt reconnecting, rather than a generic 502.
-    """
-    owns_client = http_client is None
+async def _get_access_token(refresh_token: str, http_client: httpx.AsyncClient | None = None) -> str:
+    owns = http_client is None
     client = http_client or httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT_SECONDS)
     try:
-        response = await client.post(
-            _TOKEN_ENDPOINT,
-            data={
-                "refresh_token": refresh_token,
-                "client_id": settings.google_client_id,
-                "client_secret": settings.google_client_secret,
-                "grant_type": "refresh_token",
-            },
-        )
+        response = await client.post(_TOKEN_ENDPOINT, data={"refresh_token": refresh_token, "client_id": settings.google_client_id, "client_secret": settings.google_client_secret, "grant_type": "refresh_token"})
     finally:
-        if owns_client:
+        if owns:
             await client.aclose()
     if response.status_code != 200:
-        body_text = response.text
-        if "invalid_grant" in body_text:
-            raise GmailApiError(
-                "Gmail access has been revoked or expired.", invalid_grant=True
-            )
+        if "invalid_grant" in response.text:
+            raise GmailApiError("Gmail access has been revoked or expired.", invalid_grant=True)
         raise GmailApiError(f"Failed to refresh access token: HTTP {response.status_code}")
-
-    access_token = response.json().get("access_token")
-    if not access_token:
+    token = response.json().get("access_token")
+    if not token:
         raise GmailApiError("Token refresh response did not include an access token.")
-    return access_token
+    return token
+
+
+@dataclass(frozen=True)
+class SkippedAttachment:
+    filename: str
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -195,140 +99,140 @@ class FetchedMessage:
     sender: str
     subject: str
     body: str
-    received_at: str  # ISO 8601, best-effort parsed from the Date header
+    received_at: str
+    urls: tuple[str, ...] = ()
+    urls_found: int = 0
+    attachments: tuple[EmailAttachment, ...] = ()
+    attachments_found: int = 0
+    skipped_attachments: tuple[SkippedAttachment, ...] = ()
 
 
 def _decode_base64url(data: str) -> str:
-    padded = data + "=" * (-len(data) % 4)
-    return base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)).decode("utf-8", errors="replace")
 
 
-def _extract_body(payload: dict) -> str:
-    """Walk a Gmail message payload's MIME tree for the best available
-    text content. Prefers text/plain; falls back to a crude HTML strip
-    of text/html if that's all the message has.
-    """
-    mime_type = payload.get("mimeType", "")
-    body_data = payload.get("body", {}).get("data")
-
-    if mime_type == "text/plain" and body_data:
-        return _decode_base64url(body_data)
-
-    parts = payload.get("parts") or []
-    html_fallback: str | None = None
-    for part in parts:
-        part_mime = part.get("mimeType", "")
-        part_data = part.get("body", {}).get("data")
-        if part_mime == "text/plain" and part_data:
-            return _decode_base64url(part_data)
-        if part_mime == "text/html" and part_data and html_fallback is None:
-            html_fallback = _decode_base64url(part_data)
-        elif part.get("parts"):
-            # Nested multipart (e.g. multipart/alternative inside
-            # multipart/mixed with attachments) -- recurse.
-            nested = _extract_body(part)
-            if nested:
-                return nested
-
-    if html_fallback is not None:
-        # Crude tag strip -- good enough for rule-based text analysis,
-        # not meant to be a full HTML-to-text converter.
-        text = re.sub(r"<[^>]+>", " ", html_fallback)
-        return re.sub(r"\s+", " ", text).strip()
-
-    if mime_type != "text/plain" and body_data:
-        return _decode_base64url(body_data)
-
-    return ""
+def _decode_bytes(data: str) -> bytes:
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
 
 
 def _header(headers: list[dict], name: str) -> str:
-    for h in headers:
-        if h.get("name", "").lower() == name.lower():
-            return h.get("value", "")
-    return ""
+    return next((h.get("value", "") for h in headers if h.get("name", "").lower() == name.lower()), "")
 
 
-def _parse_received_at(date_header: str) -> str:
-    if not date_header:
-        return datetime.now(timezone.utc).isoformat()
+def _parse_received_at(value: str) -> str:
     try:
-        parsed = parsedate_to_datetime(date_header)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.isoformat()
+        parsed = parsedate_to_datetime(value)
+        return (parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)).isoformat()
     except (TypeError, ValueError):
         return datetime.now(timezone.utc).isoformat()
 
 
-async def fetch_recent_messages(
-    refresh_token: str,
-    *,
-    limit: int = MESSAGE_BATCH_SIZE,
-    http_client: httpx.AsyncClient | None = None,
-) -> list[FetchedMessage]:
-    """Fetch the `limit` most recent messages from the inbox.
+def _walk_parts(payload: dict) -> list[dict]:
+    parts = [payload]
+    for part in payload.get("parts") or []:
+        parts.extend(_walk_parts(part))
+    return parts
 
-    Two Gmail API calls per message (list, then get) is the standard
-    pattern for this API -- the list endpoint only returns message IDs,
-    not content. `limit` is intentionally small (default 10) to keep
-    check-now's total latency reasonable, since each message also
-    triggers the full analysis pipeline (including two external URL
-    reputation calls if the message contains a URL).
-    """
-    owns_client = http_client is None
+
+def _extract_body(payload: dict) -> str:
+    parts = _walk_parts(payload)
+    plain = [p for p in parts if p.get("mimeType") == "text/plain" and p.get("body", {}).get("data")]
+    html = [p for p in parts if p.get("mimeType") == "text/html" and p.get("body", {}).get("data")]
+    selected = plain[:1] or html[:1]
+    if not selected:
+        return ""
+    text = _decode_base64url(selected[0]["body"]["data"])
+    if selected[0].get("mimeType") == "text/html":
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _canonical_urls(payload: dict) -> tuple[int, tuple[str, ...]]:
+    candidates: list[str] = []
+    for part in _walk_parts(payload):
+        if part.get("mimeType") in {"text/plain", "text/html"} and (data := part.get("body", {}).get("data")):
+            candidates.extend(_URL_PATTERN.findall(_decode_base64url(data)))
+    unique: list[str] = []
+    for candidate in candidates:
+        cleaned = candidate.rstrip(".,;:!?)]}\"'")
+        parsed = urlsplit(cleaned)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            continue
+        normalized = urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", parsed.query, ""))
+        if normalized not in unique:
+            unique.append(normalized)
+    return len(unique), tuple(unique[:MAX_EMAIL_URLS])
+
+
+async def _collect_attachments(message_id: str, payload: dict, client: httpx.AsyncClient, headers: dict[str, str]) -> tuple[int, tuple[EmailAttachment, ...], tuple[SkippedAttachment, ...]]:
+    candidates = [p for p in _walk_parts(payload) if p.get("filename")]
+    skipped: list[SkippedAttachment] = []
+    selected: list[dict] = []
+    running_size = 0
+    for part in candidates:
+        filename, content_type = part.get("filename", "attachment"), part.get("mimeType", "")
+        body = part.get("body", {})
+        size = int(body.get("size", 0) or 0)
+        if content_type not in _SUPPORTED_ATTACHMENT_TYPES:
+            skipped.append(SkippedAttachment(filename, "Unsupported attachment type."))
+        elif len(selected) >= MAX_EMAIL_ATTACHMENTS:
+            skipped.append(SkippedAttachment(filename, "Supported attachment limit reached."))
+        elif size <= 0:
+            skipped.append(SkippedAttachment(filename, "Attachment size is unavailable."))
+        elif size > MAX_ATTACHMENT_BYTES:
+            skipped.append(SkippedAttachment(filename, "Attachment exceeds the 5 MB per-file limit."))
+        elif running_size + size > MAX_TOTAL_ATTACHMENT_BYTES:
+            skipped.append(SkippedAttachment(filename, "Total attachment download limit reached."))
+        else:
+            selected.append(part)
+            running_size += size
+
+    async def download(part: dict) -> EmailAttachment | SkippedAttachment:
+        body, filename, content_type = part.get("body", {}), part.get("filename", "attachment"), part.get("mimeType", "")
+        if data := body.get("data"):
+            raw = _decode_bytes(data)
+        else:
+            attachment_id = body.get("attachmentId")
+            if not attachment_id:
+                return SkippedAttachment(filename, "Attachment data is unavailable.")
+            response = await client.get(f"{_GMAIL_API_BASE}/messages/{message_id}/attachments/{attachment_id}", headers=headers)
+            if response.status_code != 200:
+                return SkippedAttachment(filename, "Attachment could not be downloaded.")
+            raw = _decode_bytes(response.json().get("data", ""))
+        if len(raw) > MAX_ATTACHMENT_BYTES:
+            return SkippedAttachment(filename, "Attachment exceeds the 5 MB per-file limit.")
+        return EmailAttachment(filename=filename, content_type=content_type, data=raw)
+
+    downloaded = await asyncio.gather(*(download(part) for part in selected))
+    attachments = tuple(item for item in downloaded if isinstance(item, EmailAttachment))
+    skipped.extend(item for item in downloaded if isinstance(item, SkippedAttachment))
+    return len(candidates), attachments, tuple(skipped)
+
+
+async def fetch_recent_messages(refresh_token: str, *, limit: int = MESSAGE_BATCH_SIZE, http_client: httpx.AsyncClient | None = None) -> list[FetchedMessage]:
+    owns = http_client is None
     client = http_client or httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT_SECONDS)
-
     try:
-        access_token = await _get_access_token(refresh_token, client)
-        headers = {"Authorization": f"Bearer {access_token}"}
-
-        list_response = await client.get(
-            f"{_GMAIL_API_BASE}/messages",
-            headers=headers,
-            params={"maxResults": limit, "labelIds": "INBOX"},
-        )
-        if list_response.status_code == 401:
+        token = await _get_access_token(refresh_token, client)
+        headers = {"Authorization": f"Bearer {token}"}
+        response = await client.get(f"{_GMAIL_API_BASE}/messages", headers=headers, params={"maxResults": limit, "labelIds": "INBOX"})
+        if response.status_code == 401:
             raise GmailApiError("Gmail access token was rejected.", invalid_grant=True)
-        if list_response.status_code != 200:
-            raise GmailApiError(
-                f"Gmail message list failed: HTTP {list_response.status_code}"
-            )
-
-        message_refs = list_response.json().get("messages", [])
+        if response.status_code != 200:
+            raise GmailApiError(f"Gmail message list failed: HTTP {response.status_code}")
 
         async def fetch_one(ref: dict) -> FetchedMessage | None:
-            """Fetch one full message. A failure is isolated to this
-            message so one inaccessible/malformed email does not block
-            the rest of the on-demand batch.
-            """
-            msg_response = await client.get(
-                f"{_GMAIL_API_BASE}/messages/{ref['id']}",
-                headers=headers,
-                params={"format": "full"},
-            )
-            if msg_response.status_code != 200:
+            message = await client.get(f"{_GMAIL_API_BASE}/messages/{ref['id']}", headers=headers, params={"format": "full"})
+            if message.status_code != 200:
                 return None
+            raw = message.json(); payload = raw.get("payload", {}); message_id = raw.get("id", ref["id"])
+            urls_found, urls = _canonical_urls(payload)
+            attachment_data = await _collect_attachments(message_id, payload, client, headers)
+            return FetchedMessage(message_id=message_id, sender=_header(payload.get("headers", []), "From"), subject=_header(payload.get("headers", []), "Subject"), body=_extract_body(payload), received_at=_parse_received_at(_header(payload.get("headers", []), "Date")), urls=urls, urls_found=urls_found, attachments=attachment_data[1], attachments_found=attachment_data[0], skipped_attachments=attachment_data[2])
 
-            msg_json = msg_response.json()
-            payload = msg_json.get("payload", {})
-            gmail_headers = payload.get("headers", [])
-            return FetchedMessage(
-                message_id=msg_json.get("id", ref["id"]),
-                sender=_header(gmail_headers, "From"),
-                subject=_header(gmail_headers, "Subject"),
-                body=_extract_body(payload),
-                received_at=_parse_received_at(_header(gmail_headers, "Date")),
-            )
-
-        # Fetch full messages concurrently: the old sequential version
-        # could take up to 10 × the per-request timeout for a 10-message
-        # batch. Concurrency retains the same ten-message limit but keeps
-        # a slow Gmail item from making Check now feel broken.
-        fetched = await asyncio.gather(*(fetch_one(ref) for ref in message_refs))
-        messages = [message for message in fetched if message is not None]
+        fetched = await asyncio.gather(*(fetch_one(ref) for ref in response.json().get("messages", [])))
+        return [message for message in fetched if message is not None]
     finally:
-        if owns_client:
+        if owns:
             await client.aclose()
-
-    return messages
