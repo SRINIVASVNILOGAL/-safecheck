@@ -2,8 +2,10 @@
 
 These exercise the full combined pipeline: parse_url() -> local checks
 + concurrent external providers -> calculate_risk() -> CheckResponse.
-External providers are monkeypatched at the app.api.check import site so
-no real network calls occur and provider behavior is fully controlled.
+External providers are monkeypatched at the app.graph.nodes import site
+(as of Phase 7, this is where the LangGraph extract_evidence node calls
+them -- previously app.api.check) so no real network calls occur and
+provider behavior is fully controlled.
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-import app.api.check as check_module
+import app.graph.nodes as nodes_module
 from app.main import app
 from app.risk.evidence import Evidence
 
@@ -117,9 +119,9 @@ class TestWithMockedProviders:
             return None
 
         monkeypatch.setattr(
-            check_module, "check_url_google_safe_browsing", fake_google
+            nodes_module, "check_url_google_safe_browsing", fake_google
         )
-        monkeypatch.setattr(check_module, "check_url_virustotal", fake_virustotal)
+        monkeypatch.setattr(nodes_module, "check_url_virustotal", fake_virustotal)
 
         response = client.post(
             "/v1/check",
@@ -146,9 +148,9 @@ class TestWithMockedProviders:
             return _available_virustotal_evidence()
 
         monkeypatch.setattr(
-            check_module, "check_url_google_safe_browsing", fake_google
+            nodes_module, "check_url_google_safe_browsing", fake_google
         )
-        monkeypatch.setattr(check_module, "check_url_virustotal", fake_virustotal)
+        monkeypatch.setattr(nodes_module, "check_url_virustotal", fake_virustotal)
 
         response = client.post(
             "/v1/check",
@@ -179,9 +181,9 @@ class TestWithMockedProviders:
             return None
 
         monkeypatch.setattr(
-            check_module, "check_url_google_safe_browsing", broken_google
+            nodes_module, "check_url_google_safe_browsing", broken_google
         )
-        monkeypatch.setattr(check_module, "check_url_virustotal", fake_virustotal)
+        monkeypatch.setattr(nodes_module, "check_url_virustotal", fake_virustotal)
 
         response = client.post(
             "/v1/check",

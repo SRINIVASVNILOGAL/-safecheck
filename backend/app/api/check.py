@@ -1,34 +1,25 @@
 """POST /v1/check -- the main analysis endpoint.
 
-Real, non-mock pipeline:
+As of Phase 7, the actual analysis pipeline (classify input -> gather
+evidence -> score -> explain) is expressed as a LangGraph state graph in
+app.graph.pipeline, invoked here via run_check_pipeline(). This module
+now only handles the HTTP-shape concerns: request validation passthrough
+and converting the graph's PipelineResult into the CheckResponse shape
+defined by docs/api-contract.md.
 
-TEXT / EMAIL:
-    request -> extract text -> run_all_rules() [app.risk.rules]
-            -> calculate_risk() -> CheckResponse
-
-URL (as of Phase 4 Step 6):
-    request -> parse_url() [app.analyzers.url_parser]
-            -> run_local_url_checks()               [local heuristics]
-            -> check_url_google_safe_browsing()  \\
-            -> check_url_virustotal()              } concurrently
-            -> calculate_risk() -> CheckResponse
-
-All three branches converge on the same calculate_risk() -> explanation
--> CheckResponse tail, per the "one risk engine" architecture rule.
+TEXT / EMAIL / URL all flow through the same graph (see
+app.graph.pipeline for the node sequence and per-source_type branching).
+build_check_response is also reused by app.api.document, since both
+endpoints converge on the same "one risk engine" architecture rule.
 """
 
 from __future__ import annotations
 
-import asyncio
-import logging
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 
-from app.analyzers.url_parser import parse_url
-from app.analyzers.url_rules import run_local_url_checks
-from app.integrations.google_safe_browsing import check_url_google_safe_browsing
-from app.integrations.virustotal import check_url_virustotal
+from app.graph.pipeline import PipelineResult, run_check_pipeline
 from app.models.check import (
     CheckRequest,
     CheckResponse,
@@ -36,13 +27,9 @@ from app.models.check import (
     Explanation,
     RiskInfo,
 )
-from app.risk.engine import calculate_risk
-from app.risk.evidence import Evidence
-from app.risk.rules import run_all_rules
-from app.services.explanation import generate_explanation, generate_safe_actions
+from app.risk.engine import RiskResult
 
 router = APIRouter()
-logger = logging.getLogger(__name__)
 
 
 def confidence_label(confidence: float) -> str:
@@ -61,20 +48,17 @@ def confidence_label(confidence: float) -> str:
     return "low"
 
 
-def build_check_response(
-    case_id: str, source_type, evidence_list: list[Evidence]
+def build_check_response_from_result(
+    case_id: str, source_type, pipeline_result: PipelineResult
 ) -> CheckResponse:
-    """Shared tail of the pipeline: evidence -> risk -> explanation -> response.
+    """Convert a graph PipelineResult into the API's CheckResponse shape.
 
     Used by both POST /v1/check (this module) and POST /v1/document
-    (app.api.document), since both converge on the same
-    "one risk engine" architecture rule after their input-specific
-    evidence-gathering steps.
+    (app.api.document), since both invoke the same graph
+    (app.graph.pipeline) and only differ in how they populate the initial
+    GraphState.
     """
-    result = calculate_risk(evidence_list)
-
-    summary, why, next_action, uncertainty = generate_explanation(result)
-    safe_actions = generate_safe_actions(result)
+    result: RiskResult = pipeline_result.risk_result
 
     evidence_out = [
         EvidenceOut(
@@ -97,117 +81,21 @@ def build_check_response(
         risk=RiskInfo(score=result.score, band=result.band),
         evidence=evidence_out,
         explanation=Explanation(
-            summary=summary,
-            why=why,
-            next_action=next_action,
-            uncertainty=uncertainty,
+            summary=pipeline_result.summary,
+            why=pipeline_result.why,
+            next_action=pipeline_result.next_action,
+            uncertainty=pipeline_result.uncertainty,
         ),
-        safe_actions=safe_actions,
-    )
-
-
-async def _safe_provider_call(
-    provider_name: str, coroutine
-) -> Evidence | None:
-    """Run an external provider adapter, converting any unexpected
-    exception into unavailable evidence rather than letting it crash the
-    request.
-
-    The adapters themselves (google_safe_browsing.py, virustotal.py)
-    already handle their own known failure modes (timeouts, non-200,
-    malformed JSON) internally and return unavailable evidence for those.
-    This wrapper is a defense-in-depth safety net for *unknown* failures
-    -- a bug in an adapter, an unexpected exception type, etc. -- so a
-    single provider's misbehavior can never turn into a 500 error for the
-    whole /v1/check request.
-    """
-    try:
-        return await coroutine
-    except Exception as exc:  # noqa: BLE001 - intentionally broad, see docstring
-        logger.warning("Unexpected error calling %s: %s", provider_name, exc)
-        return Evidence(
-            category="url",
-            signal=provider_name,
-            points=0,
-            reason=f"{provider_name} check failed unexpectedly and could not be completed.",
-            source=provider_name.lower(),
-            correlation_group="CORR_EXTERNAL_REPUTATION",
-            availability="unavailable",
-            confidence=0.0,
-            severity="LOW",
-        )
-
-
-async def _analyze_url(url: str) -> list[Evidence]:
-    """Run local URL heuristics and both external providers concurrently."""
-    parsed = parse_url(url)
-    local_evidence = run_local_url_checks(parsed)
-
-    google_result, virustotal_result = await asyncio.gather(
-        _safe_provider_call(
-            "GOOGLE_SAFE_BROWSING", check_url_google_safe_browsing(url)
-        ),
-        _safe_provider_call("VIRUSTOTAL", check_url_virustotal(url)),
-    )
-
-    evidence = list(local_evidence)
-    if google_result is not None:
-        evidence.append(google_result)
-    if virustotal_result is not None:
-        evidence.append(virustotal_result)
-
-    return evidence
-
-
-def _extract_text(request: CheckRequest) -> str:
-    """Pull the analyzable text out of the payload for TEXT/EMAIL requests.
-
-    Raises HTTPException(400) if the required field for the given
-    source_type is missing, per docs/api-contract.md field rules.
-
-    URL requests do not go through this function -- see _analyze_url().
-    """
-    payload = request.payload
-
-    if request.source_type == "TEXT":
-        if not payload.text or not payload.text.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="payload.text is required and must be non-empty for source_type TEXT",
-            )
-        return payload.text
-
-    if request.source_type == "EMAIL":
-        if not payload.body or not payload.body.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="payload.body is required and must be non-empty for source_type EMAIL",
-            )
-        # Combine subject and body so rules can match against either.
-        return f"{payload.subject}\n{payload.body}"
-
-    raise HTTPException(
-        status_code=422,
-        detail=f"_extract_text does not support source_type: {request.source_type!r}",
+        safe_actions=pipeline_result.safe_actions,
     )
 
 
 @router.post("/v1/check", response_model=CheckResponse)
 async def check_content(request: CheckRequest) -> CheckResponse:
-    if request.source_type == "URL":
-        payload = request.payload
-        if not payload.url or not payload.url.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="payload.url is required for source_type URL",
-            )
-        evidence = await _analyze_url(payload.url)
-    else:
-        text = _extract_text(request)
-        evidence = run_all_rules(text)
+    pipeline_result = await run_check_pipeline(request.source_type, request.payload)
 
-    return build_check_response(
+    return build_check_response_from_result(
         case_id=f"case_{uuid4().hex[:8]}",
         source_type=request.source_type,
-        evidence_list=evidence,
+        pipeline_result=pipeline_result,
     )
