@@ -148,8 +148,11 @@ export function RiskResultCard({ result }: { result: CheckResponse }) {
               Why
             </h3>
             <ul className="space-y-2">
-              {availableEvidence.map((item) => (
-                <EvidenceRow key={item.signal + item.source} item={item} />
+              {availableEvidence.map((item, index) => (
+                <EvidenceRow
+                  key={`${item.signal}-${item.source}-${item.correlationGroup}-${index}`}
+                  item={item}
+                />
               ))}
             </ul>
           </div>
@@ -161,8 +164,11 @@ export function RiskResultCard({ result }: { result: CheckResponse }) {
               Checks that could not be completed
             </h3>
             <ul className="space-y-2">
-              {unavailableEvidence.map((item) => (
-                <EvidenceRow key={item.signal + item.source} item={item} />
+              {unavailableEvidence.map((item, index) => (
+                <EvidenceRow
+                  key={`${item.signal}-${item.source}-${item.correlationGroup}-${index}`}
+                  item={item}
+                />
               ))}
             </ul>
           </div>
