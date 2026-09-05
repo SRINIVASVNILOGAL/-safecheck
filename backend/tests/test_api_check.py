@@ -124,6 +124,20 @@ class TestEmailSourceType:
         assert "OTP_REQUEST" in signals
 
 
+class TestDocumentSourceTypeRejected:
+    """DOCUMENT is a valid SourceType (used by POST /v1/document
+    responses) but must never be accepted as a request value for
+    POST /v1/check -- document analysis requires multipart/form-data
+    for file upload, which /v1/check (JSON-only) does not support."""
+
+    def test_document_source_type_in_request_body_is_rejected(self) -> None:
+        response = client.post(
+            "/v1/check",
+            json={"source_type": "DOCUMENT", "payload": {"text": "hi"}},
+        )
+        assert response.status_code == 422
+
+
 class TestUrlSourceTypeBasicValidation:
     """URL analysis behavior itself (local heuristics, external providers,
     combined scoring) is covered by tests/test_api_check_url.py, added

@@ -2,6 +2,7 @@
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.check import router as check_router
+from app.api.document import router as document_router
 from app.config import settings
 
 app = FastAPI(
@@ -18,6 +19,7 @@ app.add_middleware(
 )
 
 app.include_router(check_router)
+app.include_router(document_router)
 
 @app.get("/v1/health")
 async def health_check() -> dict[str, str]:

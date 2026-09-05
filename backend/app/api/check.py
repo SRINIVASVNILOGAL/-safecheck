@@ -45,6 +45,67 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+def confidence_label(confidence: float) -> str:
+    """Convert the internal 0.0-1.0 confidence float to the API's string label.
+
+    docs/api-contract.md's example response uses string labels
+    ("high"/"medium"/"low") for evidence confidence, while the internal
+    Evidence model uses a 0.0-1.0 float (docs/scoring-engine.md Section 4).
+    This is the conversion boundary between the two. Shared with
+    app.api.document, which also converts Evidence to EvidenceOut.
+    """
+    if confidence >= 0.85:
+        return "high"
+    if confidence >= 0.5:
+        return "medium"
+    return "low"
+
+
+def build_check_response(
+    case_id: str, source_type, evidence_list: list[Evidence]
+) -> CheckResponse:
+    """Shared tail of the pipeline: evidence -> risk -> explanation -> response.
+
+    Used by both POST /v1/check (this module) and POST /v1/document
+    (app.api.document), since both converge on the same
+    "one risk engine" architecture rule after their input-specific
+    evidence-gathering steps.
+    """
+    result = calculate_risk(evidence_list)
+
+    summary, why, next_action, uncertainty = generate_explanation(result)
+    safe_actions = generate_safe_actions(result)
+
+    evidence_out = [
+        EvidenceOut(
+            signal=item.signal,
+            category=item.category,
+            points=item.points,
+            reason=item.reason,
+            source=item.source,
+            confidence=confidence_label(item.confidence),
+            availability=item.availability,
+            correlationGroup=item.correlation_group,
+            severity=item.severity,
+        )
+        for item in result.all_evidence
+    ]
+
+    return CheckResponse(
+        case_id=case_id,
+        source_type=source_type,
+        risk=RiskInfo(score=result.score, band=result.band),
+        evidence=evidence_out,
+        explanation=Explanation(
+            summary=summary,
+            why=why,
+            next_action=next_action,
+            uncertainty=uncertainty,
+        ),
+        safe_actions=safe_actions,
+    )
+
+
 async def _safe_provider_call(
     provider_name: str, coroutine
 ) -> Evidence | None:
@@ -145,51 +206,8 @@ async def check_content(request: CheckRequest) -> CheckResponse:
         text = _extract_text(request)
         evidence = run_all_rules(text)
 
-    result = calculate_risk(evidence)
-
-    summary, why, next_action, uncertainty = generate_explanation(result)
-    safe_actions = generate_safe_actions(result)
-
-    evidence_out = [
-        EvidenceOut(
-            signal=item.signal,
-            category=item.category,
-            points=item.points,
-            reason=item.reason,
-            source=item.source,
-            confidence=_confidence_label(item.confidence),
-            availability=item.availability,
-            correlationGroup=item.correlation_group,
-            severity=item.severity,
-        )
-        for item in result.all_evidence
-    ]
-
-    return CheckResponse(
+    return build_check_response(
         case_id=f"case_{uuid4().hex[:8]}",
         source_type=request.source_type,
-        risk=RiskInfo(score=result.score, band=result.band),
-        evidence=evidence_out,
-        explanation=Explanation(
-            summary=summary,
-            why=why,
-            next_action=next_action,
-            uncertainty=uncertainty,
-        ),
-        safe_actions=safe_actions,
+        evidence_list=evidence,
     )
-
-
-def _confidence_label(confidence: float) -> str:
-    """Convert the internal 0.0-1.0 confidence float to the API's string label.
-
-    docs/api-contract.md's example response uses string labels
-    ("high"/"medium"/"low") for evidence confidence, while the internal
-    Evidence model uses a 0.0-1.0 float (docs/scoring-engine.md Section 4).
-    This is the conversion boundary between the two.
-    """
-    if confidence >= 0.85:
-        return "high"
-    if confidence >= 0.5:
-        return "medium"
-    return "low"

@@ -10,9 +10,16 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-SourceType = Literal["TEXT", "URL", "EMAIL"]
+SourceType = Literal["TEXT", "URL", "EMAIL", "DOCUMENT"]
+
+# POST /v1/check accepts these in the request body. DOCUMENT is a valid
+# SourceType (used in CheckResponse.source_type for POST /v1/document
+# responses) but is never a valid *request* value for /v1/check --
+# document analysis has its own endpoint because it needs
+# multipart/form-data for file upload, not JSON.
+_CHECK_REQUEST_SOURCE_TYPES = ("TEXT", "URL", "EMAIL")
 
 
 class CheckPayload(BaseModel):
@@ -35,6 +42,17 @@ class CheckPayload(BaseModel):
 class CheckRequest(BaseModel):
     source_type: SourceType
     payload: CheckPayload
+
+    @field_validator("source_type")
+    @classmethod
+    def _reject_document_source_type(cls, value: str) -> str:
+        if value not in _CHECK_REQUEST_SOURCE_TYPES:
+            raise ValueError(
+                f"source_type {value!r} is not valid for POST /v1/check. "
+                f"Allowed values: {_CHECK_REQUEST_SOURCE_TYPES}. "
+                "Document analysis uses POST /v1/document instead."
+            )
+        return value
 
 
 class RiskInfo(BaseModel):
