@@ -8,6 +8,7 @@ from fastapi import HTTPException
 
 from app.analyzers.document_extraction import extract_text
 from app.analyzers.document_rules import run_all_document_rules
+from app.analyzers.text_url_extraction import extract_urls_from_text
 from app.analyzers.url_parser import parse_url
 from app.analyzers.url_rules import run_local_url_checks
 from app.graph.state import EmailAttachment, GraphState
@@ -91,13 +92,27 @@ async def extract_evidence(state: GraphState) -> dict:
             evidence.append(Evidence(category="rules", signal="TEXT_TRUNCATED", points=0, reason="The extracted text exceeded the maximum length and was truncated before analysis.", source="document_analyzer", correlation_group="CORR_EXTRACTION", availability="available", confidence=1.0, severity="LOW"))
         return {"evidence": evidence}
 
-    text_evidence = run_all_rules(state.get("analysis_text") or "")
+    analysis_text = state.get("analysis_text") or ""
+    text_evidence = run_all_rules(analysis_text)
+
+    # A pasted TEXT/EMAIL message is otherwise text-rules-only: an
+    # embedded link (very often scheme-less, e.g. "kredt.be/3u9CoOh")
+    # would be completely invisible to the URL analyzer unless we
+    # extract it here. This is what previously let a toll/fee scam with
+    # a shortened link score far too low -- the link was never checked.
+    _, extracted_urls = extract_urls_from_text(analysis_text)
+    email_urls = list(state.get("email_urls", []))
+    combined_urls = list(dict.fromkeys([*email_urls, *extracted_urls]))
+    url_tasks = [_gather_url_evidence(url) for url in combined_urls]
+
     if source != "EMAIL":
-        return {"evidence": text_evidence}
-    # Email Agent fan-out: body rules, every bounded URL, and every
+        groups = await asyncio.gather(*url_tasks) if url_tasks else []
+        return {"evidence": [*text_evidence, *(item for group in groups for item in group)]}
+
+    # Email Agent fan-out: body rules, every bounded URL (from Gmail MIME
+    # extraction and/or extracted from the plain body text), and every
     # bounded supported attachment run concurrently; score_risk receives
     # their raw combined Evidence exactly once.
-    url_tasks = [_gather_url_evidence(url) for url in state.get("email_urls", [])]
     attachment_tasks = [_gather_attachment_evidence(item) for item in state.get("email_attachments", [])]
     groups = await asyncio.gather(*url_tasks, *attachment_tasks)
     return {"evidence": [*text_evidence, *(item for group in groups for item in group)]}

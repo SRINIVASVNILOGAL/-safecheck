@@ -38,8 +38,19 @@ def parse_url(raw_url: str) -> ParsedUrl:
     fields where parsing fails, so callers (url_rules.py) can decide how
     to score "this doesn't even look like a URL" as its own evidence
     signal rather than the parser crashing.
+
+    Scam messages frequently omit the scheme entirely (e.g.
+    "kredt.be/3u9CoOh" instead of "https://kredt.be/3u9CoOh"). Plain
+    urlparse() treats a schemeless string as a bare path with no netloc,
+    which would silently break every host-based rule (lookalike domain,
+    shortener detection, TLD checks). We detect that case and parse
+    against an "http://"-prefixed form so host/path split correctly,
+    while keeping `scheme` reported as "" (genuinely unspecified) rather
+    than claiming the message said "http".
     """
-    parsed = urlparse(raw_url.strip())
+    cleaned = raw_url.strip()
+    had_scheme = "://" in cleaned
+    parsed = urlparse(cleaned if had_scheme else f"http://{cleaned}")
 
     netloc = parsed.netloc
     has_userinfo = "@" in netloc
@@ -48,13 +59,13 @@ def parse_url(raw_url: str) -> ParsedUrl:
     # detect the deceptive pattern first.
     host = parsed.hostname or ""
 
-    extracted = tldextract.extract(raw_url.strip())
+    extracted = tldextract.extract(cleaned)
 
     is_ip_hostname = _looks_like_ip(host)
 
     return ParsedUrl(
         raw_url=raw_url,
-        scheme=parsed.scheme.lower(),
+        scheme=parsed.scheme.lower() if had_scheme else "",
         full_host=host.lower(),
         sld=extracted.domain.lower(),
         suffix=extracted.suffix.lower(),

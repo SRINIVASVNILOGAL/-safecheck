@@ -5,6 +5,15 @@ import type {
   CheckResponse,
   ConnectStartResponse,
   EmailStatusResponse,
+  RecentSentContact,
+  RecoveryConfirmRequest,
+  RecoveryConfirmResponse,
+  RecoveryDraft,
+  RecoveryDraftRequest,
+  WarningConfirmRequest,
+  WarningConfirmResponse,
+  WarningDraft,
+  WarningDraftRequest,
 } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
@@ -148,4 +157,78 @@ export async function checkEmailNow(): Promise<CheckNowResponse> {
   }
 
   return body as CheckNowResponse;
+}
+
+
+/** GET /v1/email/recent-sent-contacts -- bounded recent Sent-mail recipients. */
+export async function getRecentSentContacts(): Promise<RecentSentContact[]> {
+  const response = await fetch(`${API_URL}/v1/email/recent-sent-contacts`);
+  const body = await parseJsonSafely(response);
+  if (!response.ok) {
+    throw new ApiError(response.status, extractErrorMessage(body, `Request failed with status ${response.status}`));
+  }
+  return body as RecentSentContact[];
+}
+
+/** POST /v1/email/warnings/draft -- prepares an editable preview. Never sends. */
+export async function createWarningDraft(request: WarningDraftRequest): Promise<WarningDraft> {
+  const response = await fetch(`${API_URL}/v1/email/warnings/draft`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  const body = await parseJsonSafely(response);
+  if (!response.ok) {
+    throw new ApiError(response.status, extractErrorMessage(body, `Request failed with status ${response.status}`));
+  }
+  return body as WarningDraft;
+}
+
+/** POST /v1/email/warnings/{id}/confirm -- the only call that can send. */
+export async function confirmWarning(
+  warningId: string,
+  request: WarningConfirmRequest
+): Promise<WarningConfirmResponse> {
+  const response = await fetch(`${API_URL}/v1/email/warnings/${warningId}/confirm`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  const body = await parseJsonSafely(response);
+  if (!response.ok) {
+    throw new ApiError(response.status, extractErrorMessage(body, `Request failed with status ${response.status}`));
+  }
+  return body as WarningConfirmResponse;
+}
+
+/** POST /v1/recovery/draft -- identifies the relevant organization and
+ * generates an editable fraud-report email. Never sends anything. */
+export async function createRecoveryDraft(request: RecoveryDraftRequest): Promise<RecoveryDraft> {
+  const response = await fetch(`${API_URL}/v1/recovery/draft`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  const body = await parseJsonSafely(response);
+  if (!response.ok) {
+    throw new ApiError(response.status, extractErrorMessage(body, `Request failed with status ${response.status}`));
+  }
+  return body as RecoveryDraft;
+}
+
+/** POST /v1/recovery/{id}/confirm -- the only call that can send a recovery report. */
+export async function confirmRecoveryReport(
+  reportId: string,
+  request: RecoveryConfirmRequest
+): Promise<RecoveryConfirmResponse> {
+  const response = await fetch(`${API_URL}/v1/recovery/${reportId}/confirm`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  const body = await parseJsonSafely(response);
+  if (!response.ok) {
+    throw new ApiError(response.status, extractErrorMessage(body, `Request failed with status ${response.status}`));
+  }
+  return body as RecoveryConfirmResponse;
 }

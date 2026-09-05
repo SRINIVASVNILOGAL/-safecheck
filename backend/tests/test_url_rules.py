@@ -100,3 +100,53 @@ class TestTyposquatting:
         too different, should not be flagged as typosquatting."""
         parsed = parse_url("https://randomsite.com/page")
         assert detect_typosquatting(parsed) is None
+
+
+class TestShortenedLink:
+    def test_known_shortener_domain_is_flagged(self) -> None:
+        from app.analyzers.url_rules import detect_shortened_link
+
+        parsed = parse_url("https://bit.ly/abc123")
+        evidence = detect_shortened_link(parsed)
+        assert evidence is not None
+        assert evidence.signal == "SHORTENED_LINK"
+        assert evidence.points == 15
+
+    def test_unfamiliar_shortener_shaped_domain_is_flagged(self) -> None:
+        from app.analyzers.url_rules import detect_shortened_link
+
+        parsed = parse_url("kredt.be/3u9CoOh")
+        evidence = detect_shortened_link(parsed)
+        assert evidence is not None
+        assert evidence.signal == "SHORTENED_LINK"
+
+    def test_normal_page_path_is_not_flagged(self) -> None:
+        from app.analyzers.url_rules import detect_shortened_link
+
+        parsed = parse_url("https://www.sbi.co.in/personal-banking")
+        assert detect_shortened_link(parsed) is None
+
+    def test_root_path_is_not_flagged(self) -> None:
+        from app.analyzers.url_rules import detect_shortened_link
+
+        parsed = parse_url("https://github.com")
+        assert detect_shortened_link(parsed) is None
+
+
+class TestSchemelessUrlParsing:
+    """Regression: schemeless URLs previously broke host/path extraction
+    entirely (netloc was empty), hiding them from every host-based rule."""
+
+    def test_schemeless_url_has_correct_host_and_path(self) -> None:
+        parsed = parse_url("kredt.be/3u9CoOh")
+        assert parsed.registered_domain == "kredt.be"
+        assert parsed.path == "/3u9CoOh"
+        assert parsed.scheme == ""
+
+    def test_schemeless_url_does_not_trigger_insecure_http(self) -> None:
+        """Scheme is genuinely unspecified, not "http" -- must not be
+        misreported as an explicit insecure-HTTP link."""
+        from app.analyzers.url_rules import detect_insecure_http
+
+        parsed = parse_url("kredt.be/3u9CoOh")
+        assert detect_insecure_http(parsed) is None

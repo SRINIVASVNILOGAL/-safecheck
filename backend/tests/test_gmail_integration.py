@@ -38,6 +38,7 @@ class TestBuildAuthorizationUrl:
         assert "prompt=consent" in url
         assert "state=some-csrf-state" in url
         assert "gmail.readonly" in url
+        assert "gmail.send" in url
 
 
 class TestExchangeCodeForTokens:

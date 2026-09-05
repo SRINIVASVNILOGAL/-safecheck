@@ -6,9 +6,9 @@ import { useState } from "react";
 import { Header } from "@/components/Header";
 import { InputTabs } from "@/components/InputTabs";
 import type { InputTab } from "@/components/InputTabs";
-import { FileDropzone } from "@/components/FileDropzone";
+import { RecoveryPanel } from "@/components/RecoveryPanel";
 import { RiskResultCard } from "@/components/RiskResultCard";
-import { ApiError, checkContent, checkDocument } from "@/lib/api";
+import { ApiError, checkContent } from "@/lib/api";
 import type { CheckResponse } from "@/lib/types";
 
 type SubmissionState = "idle" | "loading" | "success" | "error";
@@ -18,9 +18,6 @@ export default function CheckPage() {
 
   const [text, setText] = useState("");
   const [url, setUrl] = useState("");
-  const [file, setFile] = useState<File | null>(null);
-
-  const [fileError, setFileError] = useState<string | null>(null);
 
   const [submissionState, setSubmissionState] =
     useState<SubmissionState>("idle");
@@ -32,8 +29,7 @@ export default function CheckPage() {
   const isSubmitDisabled =
     submissionState === "loading" ||
     (activeTab === "text" && text.trim().length === 0) ||
-    (activeTab === "url" && url.trim().length === 0) ||
-    (activeTab === "document" && file === null);
+    (activeTab === "url" && url.trim().length === 0);
 
   /** Switching tabs abandons any previous result -- each tab represents
    * a genuinely separate analysis, not a continuation of the same one. */
@@ -50,26 +46,10 @@ export default function CheckPage() {
     setSubmissionError(null);
 
     try {
-      let response: CheckResponse;
-
-      if (activeTab === "text") {
-        response = await checkContent({
-          source_type: "TEXT",
-          payload: { text },
-        });
-      } else if (activeTab === "url") {
-        response = await checkContent({
-          source_type: "URL",
-          payload: { url },
-        });
-      } else {
-        if (!file) {
-          // isSubmitDisabled already prevents this, but satisfies
-          // TypeScript's narrowing and guards against a future regression.
-          throw new Error("No file selected.");
-        }
-        response = await checkDocument(file);
-      }
+      const response: CheckResponse =
+        activeTab === "text"
+          ? await checkContent({ source_type: "TEXT", payload: { text } })
+          : await checkContent({ source_type: "URL", payload: { url } });
 
       setResult(response);
       setSubmissionState("success");
@@ -93,7 +73,7 @@ export default function CheckPage() {
             Dashboard / <span className="text-accent-blue">Manual Check</span>
           </p>
           <h2 className="mt-2 text-2xl font-semibold text-foreground sm:text-3xl">
-            Verify a message, URL, or file
+            Verify a message or URL
           </h2>
           <p className="mt-1 text-sm text-foreground-muted">
             Every submission runs through the same deterministic risk
@@ -104,14 +84,6 @@ export default function CheckPage() {
         <InputTabs active={activeTab} onChange={handleTabChange} />
 
         <div className="mt-6 rounded-2xl border border-border bg-surface p-5 sm:p-6">
-          {activeTab === "document" && (
-            <FileDropzone
-              file={file}
-              onFileSelected={setFile}
-              onValidationError={setFileError}
-            />
-          )}
-
           {activeTab === "url" && (
             <div>
               <label
@@ -166,13 +138,6 @@ export default function CheckPage() {
             </div>
           )}
 
-          {fileError && (
-            <p className="mt-3 flex items-center gap-2 text-sm text-accent-red">
-              <AlertTriangle className="h-4 w-4" />
-              {fileError}
-            </p>
-          )}
-
           {submissionError && (
             <p className="mt-3 flex items-center gap-2 text-sm text-accent-red">
               <AlertTriangle className="h-4 w-4" />
@@ -195,7 +160,16 @@ export default function CheckPage() {
           )}
         </div>
 
-        {result && <RiskResultCard result={result} />}
+        {result && (
+          <>
+            <RiskResultCard result={result} />
+            <RecoveryPanel
+              caseId={result.case_id}
+              contextText={activeTab === "text" ? text : url}
+              result={result}
+            />
+          </>
+        )}
 
         <p className="mt-4 text-center text-xs text-foreground-subtle">
           We do not store OTPs, PINs, or passwords found in submitted

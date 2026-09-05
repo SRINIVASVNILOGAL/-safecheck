@@ -361,3 +361,19 @@ POST /v1/webhooks/whatsapp
 ```
 
 These are not implemented yet and will get their own contract sections in later phases before implementation begins.
+
+
+## Phishing contact-warning workflow (local demo)
+
+This workflow is available only after the Gmail account has been reconnected with the `gmail.send` OAuth permission. It is explicitly confirmation-only: SafeCheck never sends a warning from analysis alone.
+
+```text
+Medium/high-risk Gmail result → fetch bounded recent Sent recipients → user selects recipients
+→ OpenRouter drafts editable subject/body → user reviews exact preview
+→ POST confirm with idempotency key → one private Gmail message per recipient
+```
+
+- `GET /v1/email/recent-sent-contacts` returns at most 20 deduplicated recipients from a bounded recent Sent-mail scan. It returns address, display name, and last-sent time only; it does not return sent-mail bodies or Bcc recipients.
+- `POST /v1/email/warnings/draft` accepts a Gmail message ID, final deterministic risk snapshot, and selected recipient addresses. It verifies every recipient appears in the freshly fetched contact list, creates an expiring local draft, and returns an editable plaintext subject/body. OpenRouter receives only the risk score/band and bounded signal codes, never recipients, email content, attachments, URLs, or user edits.
+- `POST /v1/email/warnings/{warning_id}/confirm` requires `confirmed: true`, an idempotency key, and the final reviewed subject/body. It rejects changed recipients, blank/oversized content, and URLs in the warning body. It creates an audit record before Gmail is called, then sends one message per recipient without exposing recipients to one another.
+- A duplicate confirm with the same idempotency key returns the existing campaign state rather than sending again. Provider failure is recorded per recipient. This local demo stores campaign content in its gitignored SQLite database; it is not suitable for multi-user deployment without authentication and encrypted credential/audit storage.

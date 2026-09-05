@@ -15,6 +15,7 @@ fetched via Gmail vs. email pasted manually.
 
 from __future__ import annotations
 
+import json
 import secrets
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -24,14 +25,26 @@ from fastapi.responses import RedirectResponse
 
 from app.api.check import build_check_response_from_result
 from app.config import settings
-from app.db import get_gmail_account, update_last_checked_at, upsert_gmail_account
+from app.db import (
+    claim_warning_campaign,
+    create_warning_campaign,
+    finish_warning_campaign,
+    get_gmail_account,
+    get_warning_campaign,
+    record_warning_delivery,
+    update_last_checked_at,
+    upsert_gmail_account,
+)
 from app.graph.pipeline import run_email_pipeline
 from app.integrations.gmail import (
     GmailApiError,
     build_authorization_url,
     exchange_code_for_tokens,
     fetch_recent_messages,
+    fetch_recent_sent_contacts,
+    send_warning_message,
 )
+from app.integrations.openrouter import generate_warning_copy
 from app.models.check import CheckPayload
 from app.models.email import (
     AnalysisCoverage,
@@ -39,7 +52,13 @@ from app.models.email import (
     CheckNowResponse,
     ConnectStartResponse,
     EmailStatusResponse,
+    RecentSentContactOut,
     SkippedAttachmentOut,
+    WarningConfirmRequest,
+    WarningConfirmResponse,
+    WarningDeliveryOut,
+    WarningDraftOut,
+    WarningDraftRequest,
 )
 
 router = APIRouter()
@@ -187,3 +206,112 @@ async def check_now() -> CheckNowResponse:
     await update_last_checked_at(datetime.now(timezone.utc))
 
     return CheckNowResponse(checked_count=len(results), results=results)
+
+
+@router.get("/v1/email/recent-sent-contacts", response_model=list[RecentSentContactOut])
+async def recent_sent_contacts() -> list[RecentSentContactOut]:
+    account = await get_gmail_account()
+    if account is None:
+        raise HTTPException(status_code=400, detail="No Gmail account is connected.")
+    try:
+        contacts = await fetch_recent_sent_contacts(account.refresh_token, account_email=account.email_address)
+    except GmailApiError as exc:
+        if exc.invalid_grant:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return [RecentSentContactOut(address=item.address, display_name=item.display_name, last_sent_at=item.last_sent_at) for item in contacts]
+
+
+@router.post("/v1/email/warnings/draft", response_model=WarningDraftOut)
+async def create_warning_draft(request: WarningDraftRequest) -> WarningDraftOut:
+    """Prepare an editable warning preview. Never contacts Gmail's send API."""
+    account = await get_gmail_account()
+    if account is None:
+        raise HTTPException(status_code=400, detail="No Gmail account is connected.")
+
+    try:
+        known_contacts = await fetch_recent_sent_contacts(account.refresh_token, account_email=account.email_address)
+    except GmailApiError as exc:
+        if exc.invalid_grant:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    known_addresses = {item.address for item in known_contacts}
+    unknown = [address for address in request.recipient_addresses if address not in known_addresses]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail="Recipients must come from your current recent-contacts list. Refresh and reselect.",
+        )
+
+    copy = await generate_warning_copy(risk_score=request.risk_score, risk_band=request.risk_band, signals=request.signals)
+    campaign = await create_warning_campaign(
+        gmail_message_id=request.gmail_message_id,
+        risk_score=request.risk_score,
+        risk_band=request.risk_band,
+        recipients=request.recipient_addresses,
+        subject=copy.subject,
+        body=copy.body,
+    )
+    return WarningDraftOut(warning_id=campaign.id, recipients=request.recipient_addresses, subject=copy.subject, body=copy.body, status=campaign.status)
+
+
+@router.get("/v1/email/warnings/{warning_id}", response_model=WarningDraftOut)
+async def get_warning_draft(warning_id: str) -> WarningDraftOut:
+    campaign, _ = await get_warning_campaign(warning_id)
+    if campaign is None:
+        raise HTTPException(status_code=404, detail="Warning draft not found.")
+    return WarningDraftOut(warning_id=campaign.id, recipients=json.loads(campaign.recipients_json), subject=campaign.subject, body=campaign.body, status=campaign.status)
+
+
+@router.post("/v1/email/warnings/{warning_id}/confirm", response_model=WarningConfirmResponse)
+async def confirm_warning(warning_id: str, request: WarningConfirmRequest) -> WarningConfirmResponse:
+    """The only route that ever calls Gmail's send API, and only after
+    an explicit confirmed=true plus a fresh idempotency key. A duplicate
+    confirm with the same key returns the prior result instead of
+    sending again."""
+    if not request.confirmed:
+        raise HTTPException(status_code=400, detail="confirmed must be true to send a warning.")
+    if "http://" in request.body.lower() or "https://" in request.body.lower():
+        raise HTTPException(status_code=400, detail="Warning body may not contain links.")
+
+    account = await get_gmail_account()
+    if account is None:
+        raise HTTPException(status_code=400, detail="No Gmail account is connected.")
+
+    campaign, is_new_claim = await claim_warning_campaign(
+        warning_id, idempotency_key=request.idempotency_key, subject=request.subject, body=request.body
+    )
+    if campaign is None:
+        raise HTTPException(status_code=404, detail="Warning draft not found.")
+    if not is_new_claim:
+        if campaign.idempotency_key and campaign.idempotency_key != request.idempotency_key:
+            raise HTTPException(status_code=409, detail="This warning was already confirmed with a different request.")
+        if campaign.status == "DRAFT":
+            raise HTTPException(status_code=409, detail="This warning is already being processed by another request.")
+        # Already confirmed with the same key: return existing state, do not resend.
+        _, deliveries = await get_warning_campaign(warning_id)
+        return WarningConfirmResponse(warning_id=campaign.id, status=campaign.status, deliveries=[WarningDeliveryOut(recipient=d.recipient, status=d.status, gmail_message_id=d.gmail_message_id, error=d.error) for d in deliveries])
+
+    _, deliveries = await get_warning_campaign(warning_id)
+    for delivery in deliveries:
+        try:
+            gmail_message_id = await send_warning_message(
+                account.refresh_token,
+                from_address=account.email_address,
+                recipient=delivery.recipient,
+                subject=request.subject,
+                body=request.body,
+                warning_id=warning_id,
+            )
+            await record_warning_delivery(delivery.id, status="SENT", gmail_message_id=gmail_message_id)
+        except GmailApiError as exc:
+            await record_warning_delivery(delivery.id, status="FAILED", error=str(exc)[:200])
+
+    await finish_warning_campaign(warning_id)
+    campaign, deliveries = await get_warning_campaign(warning_id)
+    return WarningConfirmResponse(
+        warning_id=campaign.id,
+        status=campaign.status,
+        deliveries=[WarningDeliveryOut(recipient=d.recipient, status=d.status, gmail_message_id=d.gmail_message_id, error=d.error) for d in deliveries],
+    )

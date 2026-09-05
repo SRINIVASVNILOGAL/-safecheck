@@ -283,3 +283,229 @@ class TestCheckNow:
         response = client.post("/v1/email/check-now")
         assert response.status_code == 200
         assert response.json()["checked_count"] == 1
+
+
+class _FakeCampaign:
+    def __init__(self, campaign_id: str, recipients: list[str]) -> None:
+        self.id = campaign_id
+        self.recipients_json = __import__("json").dumps(recipients)
+        self.subject = "Your Email Account May Have Been Compromised"
+        self.body = "My email account may have been compromised. Please do not click any links."
+        self.status = "DRAFT"
+        self.idempotency_key = None
+
+
+class _FakeDelivery:
+    def __init__(self, delivery_id: int, recipient: str, status: str = "PENDING") -> None:
+        self.id = delivery_id
+        self.recipient = recipient
+        self.status = status
+        self.gmail_message_id = None
+        self.error = None
+
+
+class TestWarningDraftAndConfirm:
+    def _connected_account(self):
+        async def fake_get_account():
+            return GmailAccount(id=1, email_address="me@gmail.com", refresh_token="rt")
+        return fake_get_account
+
+    def test_draft_rejects_recipient_not_in_recent_contacts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.integrations.gmail import RecentSentContact
+
+        async def fake_get_account():
+            return GmailAccount(id=1, email_address="me@gmail.com", refresh_token="rt")
+
+        async def fake_contacts(refresh_token: str, *, account_email: str):
+            return [RecentSentContact(address="known@example.com", display_name="", last_sent_at="2026-09-01T00:00:00+00:00")]
+
+        monkeypatch.setattr(email_module, "get_gmail_account", fake_get_account)
+        monkeypatch.setattr(email_module, "fetch_recent_sent_contacts", fake_contacts)
+
+        response = client.post(
+            "/v1/email/warnings/draft",
+            json={
+                "gmail_message_id": "msg1",
+                "risk_score": 80,
+                "risk_band": "HIGH",
+                "signals": ["OTP_REQUEST"],
+                "recipient_addresses": ["stranger@example.com"],
+            },
+        )
+        assert response.status_code == 400
+
+    def test_draft_generates_editable_preview_without_sending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.integrations.gmail import RecentSentContact
+        from app.integrations.openrouter import WarningCopy
+
+        monkeypatch.setattr(email_module, "get_gmail_account", self._connected_account())
+
+        async def fake_contacts(refresh_token: str, *, account_email: str):
+            return [RecentSentContact(address="known@example.com", display_name="Known", last_sent_at="2026-09-01T00:00:00+00:00")]
+
+        async def fake_copy(*, risk_score: int, risk_band: str, signals: list[str]):
+            return WarningCopy(subject="Test subject", body="Test body without links.")
+
+        send_calls: list[str] = []
+
+        async def fake_send(*args, **kwargs):
+            send_calls.append("called")
+            return "gmail_msg_id"
+
+        async def fake_create_campaign(**kwargs):
+            return _FakeCampaign("warning_123", kwargs["recipients"])
+
+        monkeypatch.setattr(email_module, "fetch_recent_sent_contacts", fake_contacts)
+        monkeypatch.setattr(email_module, "generate_warning_copy", fake_copy)
+        monkeypatch.setattr(email_module, "send_warning_message", fake_send)
+        monkeypatch.setattr(email_module, "create_warning_campaign", fake_create_campaign)
+
+        response = client.post(
+            "/v1/email/warnings/draft",
+            json={
+                "gmail_message_id": "msg1",
+                "risk_score": 80,
+                "risk_band": "HIGH",
+                "signals": ["OTP_REQUEST"],
+                "recipient_addresses": ["known@example.com"],
+            },
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["subject"] == "Test subject"
+        assert body["recipients"] == ["known@example.com"]
+        assert send_calls == []  # drafting must never call Gmail send
+
+    def test_confirm_requires_confirmed_true(self) -> None:
+        response = client.post(
+            "/v1/email/warnings/warning_123/confirm",
+            json={"confirmed": False, "idempotency_key": "key-12345678", "subject": "s", "body": "b"},
+        )
+        assert response.status_code == 400
+
+    def test_confirm_rejects_links_in_body(self) -> None:
+        response = client.post(
+            "/v1/email/warnings/warning_123/confirm",
+            json={
+                "confirmed": True,
+                "idempotency_key": "key-12345678",
+                "subject": "s",
+                "body": "Click https://evil.example.com now.",
+            },
+        )
+        assert response.status_code == 400
+
+    def test_confirm_missing_draft_returns_404(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(email_module, "get_gmail_account", self._connected_account())
+
+        async def fake_claim(campaign_id, *, idempotency_key, subject, body):
+            return None, False
+
+        monkeypatch.setattr(email_module, "claim_warning_campaign", fake_claim)
+
+        response = client.post(
+            "/v1/email/warnings/missing/confirm",
+            json={"confirmed": True, "idempotency_key": "key-12345678", "subject": "s", "body": "b"},
+        )
+        assert response.status_code == 404
+
+    def test_confirm_sends_one_message_per_recipient_then_marks_sent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(email_module, "get_gmail_account", self._connected_account())
+        campaign = _FakeCampaign("warning_123", ["a@example.com", "b@example.com"])
+        deliveries = [_FakeDelivery(1, "a@example.com"), _FakeDelivery(2, "b@example.com")]
+
+        async def fake_claim(campaign_id, *, idempotency_key, subject, body):
+            return campaign, True
+
+        calls: list[tuple] = []
+
+        async def fake_get_campaign(campaign_id):
+            return campaign, deliveries
+
+        async def fake_send(refresh_token, *, from_address, recipient, subject, body, warning_id):
+            calls.append(recipient)
+            return f"sent_{recipient}"
+
+        async def fake_record(delivery_id, *, status, gmail_message_id=None, error=None):
+            for delivery in deliveries:
+                if delivery.id == delivery_id:
+                    delivery.status, delivery.gmail_message_id, delivery.error = status, gmail_message_id, error
+
+        async def fake_finish(campaign_id):
+            campaign.status = "SENT"
+
+        monkeypatch.setattr(email_module, "claim_warning_campaign", fake_claim)
+        monkeypatch.setattr(email_module, "get_warning_campaign", fake_get_campaign)
+        monkeypatch.setattr(email_module, "send_warning_message", fake_send)
+        monkeypatch.setattr(email_module, "record_warning_delivery", fake_record)
+        monkeypatch.setattr(email_module, "finish_warning_campaign", fake_finish)
+
+        response = client.post(
+            "/v1/email/warnings/warning_123/confirm",
+            json={"confirmed": True, "idempotency_key": "key-12345678", "subject": "s", "body": "No links here."},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "SENT"
+        assert sorted(calls) == ["a@example.com", "b@example.com"]
+        assert all(d["status"] == "SENT" for d in body["deliveries"])
+
+    def test_duplicate_confirm_with_same_key_does_not_resend(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(email_module, "get_gmail_account", self._connected_account())
+        campaign = _FakeCampaign("warning_123", ["a@example.com"])
+        campaign.status = "SENT"
+        campaign.idempotency_key = "key-12345678"
+        deliveries = [_FakeDelivery(1, "a@example.com", status="SENT")]
+
+        async def fake_claim(campaign_id, *, idempotency_key, subject, body):
+            return campaign, False
+
+        async def fake_get_campaign(campaign_id):
+            return campaign, deliveries
+
+        send_calls: list[str] = []
+
+        async def fake_send(*args, **kwargs):
+            send_calls.append("called")
+            return "should-not-happen"
+
+        monkeypatch.setattr(email_module, "claim_warning_campaign", fake_claim)
+        monkeypatch.setattr(email_module, "get_warning_campaign", fake_get_campaign)
+        monkeypatch.setattr(email_module, "send_warning_message", fake_send)
+
+        response = client.post(
+            "/v1/email/warnings/warning_123/confirm",
+            json={"confirmed": True, "idempotency_key": "key-12345678", "subject": "s", "body": "No links here."},
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "SENT"
+        assert send_calls == []
+
+    def test_confirm_with_different_key_after_already_confirmed_returns_409(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(email_module, "get_gmail_account", self._connected_account())
+        campaign = _FakeCampaign("warning_123", ["a@example.com"])
+        campaign.status = "SENT"
+        campaign.idempotency_key = "key-original-1"
+
+        async def fake_claim(campaign_id, *, idempotency_key, subject, body):
+            return campaign, False
+
+        monkeypatch.setattr(email_module, "claim_warning_campaign", fake_claim)
+
+        response = client.post(
+            "/v1/email/warnings/warning_123/confirm",
+            json={"confirmed": True, "idempotency_key": "key-different-2", "subject": "s", "body": "No links here."},
+        )
+        assert response.status_code == 409

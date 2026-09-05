@@ -1,9 +1,9 @@
 "use client";
 
-import { FileText, Image as ImageIcon, Link2 } from "lucide-react";
+import { FileText, Link2 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
-export type InputTab = "text" | "url" | "document";
+export type InputTab = "text" | "url";
 
 interface TabDefinition {
   id: InputTab;
@@ -12,16 +12,13 @@ interface TabDefinition {
   icon: LucideIcon;
 }
 
-/** Three tabs matching our three real analyzers. No QR tab -- that
- * backend feature does not exist (deliberately out of scope, per an
- * earlier project decision), so no UI is built to promise it. */
+/** Two tabs matching the two supported manual analyzers. Screenshot/file
+ * upload is temporarily removed from the UI (extraction quality was not
+ * good enough yet) -- the backend /v1/document endpoint and analyzer are
+ * left intact so this can be re-enabled later without re-implementing it.
+ * No QR tab -- that backend feature does not exist (deliberately out of
+ * scope, per an earlier project decision), so no UI is built to promise it. */
 const TABS: TabDefinition[] = [
-  {
-    id: "document",
-    label: "Screenshot / File",
-    sublabel: "PDF, PNG, JPEG",
-    icon: ImageIcon,
-  },
   {
     id: "url",
     label: "Direct URL",

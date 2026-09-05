@@ -68,6 +68,17 @@ _REMOTE_ACCESS_TOOL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Toll/fee/fine/invoice scam framing (e.g. fake "unpaid toll" SMS), a
+# widely reported real-world pattern that had no coverage at all before
+# this rule -- the message previously fell through to only URGENT_PAYMENT.
+_FEE_OR_FINE_PATTERN = re.compile(
+    r"\b(unpaid|outstanding|overdue|pending)\b.{0,30}\b"
+    r"(toll|fee|fine|invoice|bill|charge)\b"
+    r"|\b(toll|fee|fine|invoice|bill|charge)\b.{0,30}\b"
+    r"(unpaid|outstanding|overdue|due|pending)\b",
+    re.IGNORECASE,
+)
+
 
 def _rule_urgent_payment(text: str) -> Evidence | None:
     match = _URGENT_PAYMENT_PATTERN.search(text)
@@ -181,6 +192,22 @@ def _rule_impersonation(text: str) -> Evidence | None:
     )
 
 
+def _rule_fee_or_fine(text: str) -> Evidence | None:
+    match = _FEE_OR_FINE_PATTERN.search(text)
+    if not match:
+        return None
+    return Evidence(
+        category="rules",
+        signal="FEE_OR_FINE_SCAM",
+        points=15,
+        reason="The message claims an unpaid toll, fee, fine, or invoice and pressures payment.",
+        observed_value=match.group(0),
+        source="rule_engine",
+        correlation_group="CORR_URGENCY",
+        severity="MEDIUM",
+    )
+
+
 def _rule_remote_access_tool(text: str) -> Evidence | None:
     match = _REMOTE_ACCESS_TOOL_PATTERN.search(text)
     if not match:
@@ -204,6 +231,7 @@ ALL_RULES: list[Callable[[str], Evidence | None]] = [
     _rule_pin_request,
     _rule_password_request,
     _rule_account_blocked,
+    _rule_fee_or_fine,
     _rule_lottery_or_prize,
     _rule_impersonation,
     _rule_remote_access_tool,

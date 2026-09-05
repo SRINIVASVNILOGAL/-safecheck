@@ -11,7 +11,8 @@ import base64
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
+from email.message import EmailMessage
+from email.utils import getaddresses, parsedate_to_datetime
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -22,8 +23,10 @@ from app.graph.state import EmailAttachment
 _AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
 _TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 _GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
-_SCOPES = "https://www.googleapis.com/auth/gmail.readonly openid email"
+_SCOPES = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send openid email"
 MESSAGE_BATCH_SIZE = 10
+CONTACT_SCAN_LIMIT = 40
+MAX_WARNING_RECIPIENTS = 20
 MAX_EMAIL_URLS = 5
 MAX_EMAIL_ATTACHMENTS = 3
 MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
@@ -233,6 +236,95 @@ async def fetch_recent_messages(refresh_token: str, *, limit: int = MESSAGE_BATC
 
         fetched = await asyncio.gather(*(fetch_one(ref) for ref in response.json().get("messages", [])))
         return [message for message in fetched if message is not None]
+    finally:
+        if owns:
+            await client.aclose()
+
+
+@dataclass(frozen=True)
+class RecentSentContact:
+    address: str
+    display_name: str
+    last_sent_at: str
+
+
+async def fetch_recent_sent_contacts(
+    refresh_token: str,
+    *,
+    account_email: str,
+    http_client: httpx.AsyncClient | None = None,
+) -> list[RecentSentContact]:
+    """Fetch bounded metadata-only Sent recipients; never reads bodies or Bcc."""
+    owns = http_client is None
+    client = http_client or httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT_SECONDS)
+    try:
+        token = await _get_access_token(refresh_token, client)
+        headers = {"Authorization": f"Bearer {token}"}
+        listed = await client.get(
+            f"{_GMAIL_API_BASE}/messages",
+            headers=headers,
+            params={"maxResults": CONTACT_SCAN_LIMIT, "labelIds": "SENT"},
+        )
+        if listed.status_code != 200:
+            raise GmailApiError("Could not fetch recent sent-mail contacts.", invalid_grant=listed.status_code == 401)
+
+        async def fetch_headers(ref: dict) -> tuple[str, str]:
+            response = await client.get(
+                f"{_GMAIL_API_BASE}/messages/{ref['id']}",
+                headers=headers,
+                params={"format": "metadata", "metadataHeaders": ["To", "Date"]},
+            )
+            if response.status_code != 200:
+                return "", ""
+            headers_data = response.json().get("payload", {}).get("headers", [])
+            return _header(headers_data, "To"), _parse_received_at(_header(headers_data, "Date"))
+
+        values = await asyncio.gather(*(fetch_headers(item) for item in listed.json().get("messages", [])))
+        contacts: list[RecentSentContact] = []
+        seen: set[str] = set()
+        for to_value, sent_at in values:
+            for display_name, address in getaddresses([to_value]):
+                normalized = address.strip().lower()
+                if not normalized or "@" not in normalized or normalized == account_email.lower() or normalized in seen:
+                    continue
+                seen.add(normalized)
+                contacts.append(RecentSentContact(address=normalized, display_name=display_name.strip(), last_sent_at=sent_at))
+                if len(contacts) >= MAX_WARNING_RECIPIENTS:
+                    return contacts
+        return contacts
+    finally:
+        if owns:
+            await client.aclose()
+
+
+async def send_warning_message(
+    refresh_token: str,
+    *,
+    from_address: str,
+    recipient: str,
+    subject: str,
+    body: str,
+    warning_id: str,
+    http_client: httpx.AsyncClient | None = None,
+) -> str:
+    """Send one private plaintext warning only after API confirmation."""
+    message = EmailMessage()
+    message["From"] = from_address
+    message["To"] = recipient
+    message["Subject"] = subject
+    message["X-SafeCheck-Warning-Id"] = warning_id
+    message.set_content(body)
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii").rstrip("=")
+    owns = http_client is None
+    client = http_client or httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT_SECONDS)
+    try:
+        token = await _get_access_token(refresh_token, client)
+        response = await client.post(f"{_GMAIL_API_BASE}/messages/send", headers={"Authorization": f"Bearer {token}"}, json={"raw": raw})
+        if response.status_code in {401, 403}:
+            raise GmailApiError("Gmail send permission is missing. Reconnect Gmail and approve send permission.", invalid_grant=response.status_code == 401)
+        if response.status_code != 200:
+            raise GmailApiError(f"Gmail warning send failed: HTTP {response.status_code}")
+        return response.json().get("id", "")
     finally:
         if owns:
             await client.aclose()

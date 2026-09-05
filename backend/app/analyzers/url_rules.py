@@ -24,6 +24,8 @@ brands at once.
 
 from __future__ import annotations
 
+import re
+
 import Levenshtein
 
 from app.analyzers.url_config import (
@@ -31,6 +33,7 @@ from app.analyzers.url_config import (
     get_high_risk_tlds,
     get_levenshtein_length_window,
     get_levenshtein_max_distance,
+    get_url_shorteners,
 )
 from app.analyzers.url_parser import ParsedUrl
 from app.risk.evidence import Evidence
@@ -40,6 +43,12 @@ TYPOSQUATTING_POINTS = 25
 INSECURE_HTTP_POINTS = 10
 IP_HOSTNAME_POINTS = 15
 HIGH_RISK_TLD_POINTS = 10
+SHORTENED_LINK_POINTS = 15
+
+# A shortener/redirect-style path is a single segment of short, dense
+# alphanumeric characters with no words or extra slashes -- e.g. "/3u9CoOh"
+# (bit.ly/tinyurl style) rather than a normal page path like "/personal-banking".
+_SHORT_CODE_PATH_PATTERN = re.compile(r"^/[A-Za-z0-9]{4,12}/?$")
 
 
 def _is_official_or_subdomain_of(registered_domain: str, official_domains: list[str]) -> bool:
@@ -215,6 +224,47 @@ def detect_high_risk_tld(parsed: ParsedUrl) -> Evidence | None:
     )
 
 
+def detect_shortened_link(parsed: ParsedUrl) -> Evidence | None:
+    """Flags known URL shorteners and shortener-shaped redirect links.
+
+    A shortened link hides the real destination, which is exactly the
+    obfuscation technique used in toll/fee/delivery scam messages (e.g.
+    "kredt.be/3u9CoOh"). Two cases are flagged:
+    1. The domain is a known shortener service (get_url_shorteners()) --
+       previously loaded from config but never actually used by any rule.
+    2. The domain is unrecognized but the path looks like a shortener's
+       redirect code (short, dense alphanumeric segment, no real words),
+       which is how most unfamiliar shortener-style domains present.
+    """
+    if not parsed.registered_domain:
+        return None
+    if parsed.registered_domain in get_url_shorteners():
+        return Evidence(
+            category="url",
+            signal="SHORTENED_LINK",
+            points=SHORTENED_LINK_POINTS,
+            reason="The URL uses a known link-shortening service, which hides the real destination.",
+            observed_value=parsed.registered_domain,
+            source="url_analyzer",
+            correlation_group="CORR_STRUCTURE",
+            confidence=0.7,
+            severity="MEDIUM",
+        )
+    if _SHORT_CODE_PATH_PATTERN.match(parsed.path) and parsed.sld and len(parsed.sld) <= 8:
+        return Evidence(
+            category="url",
+            signal="SHORTENED_LINK",
+            points=SHORTENED_LINK_POINTS,
+            reason="The URL's short domain and redirect-style path resemble a link shortener, which hides the real destination.",
+            observed_value=f"{parsed.registered_domain}{parsed.path}",
+            source="url_analyzer",
+            correlation_group="CORR_STRUCTURE",
+            confidence=0.5,
+            severity="MEDIUM",
+        )
+    return None
+
+
 def run_local_url_checks(parsed: ParsedUrl) -> list[Evidence]:
     """Run every local (non-network) URL rule and collect the evidence.
 
@@ -238,7 +288,7 @@ def run_local_url_checks(parsed: ParsedUrl) -> list[Evidence]:
         if typosquat is not None:
             evidence.append(typosquat)
 
-    for check in (detect_insecure_http, detect_ip_hostname, detect_high_risk_tld):
+    for check in (detect_insecure_http, detect_ip_hostname, detect_high_risk_tld, detect_shortened_link):
         result = check(parsed)
         if result is not None:
             evidence.append(result)

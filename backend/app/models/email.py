@@ -1,12 +1,8 @@
-"""Request/response models for the /v1/email/* endpoints.
-
-Matches docs/api-contract.md's "Gmail integration (Phase 9)" section.
-"""
-
+"""Request/response models for the /v1/email/* endpoints."""
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
-
+from typing import Literal
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from app.models.check import CheckResponse
 
 
@@ -35,18 +31,64 @@ class SkippedAttachmentOut(BaseModel):
 
 class CheckedMessage(BaseModel):
     message_id: str
-    # Gmail's own header is "From"; `from` is a reserved word in Python,
-    # so the model field is from_ but serializes as "from" over the
-    # wire, matching docs/api-contract.md exactly.
     from_: str = Field(serialization_alias="from")
     subject: str
     received_at: str
     analysis_coverage: AnalysisCoverage = Field(default_factory=AnalysisCoverage)
     check: CheckResponse
-
     model_config = ConfigDict(populate_by_name=True)
 
 
 class CheckNowResponse(BaseModel):
     checked_count: int
     results: list[CheckedMessage]
+
+
+class RecentSentContactOut(BaseModel):
+    address: str
+    display_name: str = ""
+    last_sent_at: str
+
+
+class WarningDraftRequest(BaseModel):
+    gmail_message_id: str = Field(min_length=1, max_length=256)
+    risk_score: int = Field(ge=0, le=100)
+    risk_band: Literal["MEDIUM", "HIGH"]
+    signals: list[str] = Field(min_length=1, max_length=8)
+    recipient_addresses: list[str] = Field(min_length=1, max_length=20)
+
+    @field_validator("recipient_addresses")
+    @classmethod
+    def normalize_recipients(cls, values: list[str]) -> list[str]:
+        normalized = list(dict.fromkeys(value.strip().lower() for value in values if value.strip()))
+        if not normalized or any("@" not in value for value in normalized):
+            raise ValueError("Select one or more valid recent-contact email addresses.")
+        return normalized
+
+
+class WarningDraftOut(BaseModel):
+    warning_id: str
+    recipients: list[str]
+    subject: str
+    body: str
+    status: str
+
+
+class WarningConfirmRequest(BaseModel):
+    confirmed: bool
+    idempotency_key: str = Field(min_length=8, max_length=128)
+    subject: str = Field(min_length=1, max_length=180)
+    body: str = Field(min_length=1, max_length=3000)
+
+
+class WarningDeliveryOut(BaseModel):
+    recipient: str
+    status: str
+    gmail_message_id: str | None = None
+    error: str | None = None
+
+
+class WarningConfirmResponse(BaseModel):
+    warning_id: str
+    status: str
+    deliveries: list[WarningDeliveryOut]

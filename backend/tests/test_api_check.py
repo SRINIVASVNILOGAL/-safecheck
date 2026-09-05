@@ -159,3 +159,33 @@ class TestHealthEndpointStillWorks:
         response = client.get("/v1/health")
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
+
+
+class TestFeeScamWithEmbeddedShortenedLink:
+    """Regression test for a reported bug: this exact message previously
+    scored 15 (LOW band) because (a) no rule covered toll/fee/fine scam
+    framing, and (b) TEXT submissions never extracted or analyzed an
+    embedded link at all, let alone one with no "http://" prefix."""
+
+    def test_toll_fee_scam_with_bracketed_shortened_link_is_flagged(self) -> None:
+        response = client.post(
+            "/v1/check",
+            json={
+                "source_type": "TEXT",
+                "payload": {
+                    "text": (
+                        "Alert: You have an unpaid toll fee of $3.25. Pay "
+                        "immediately to avoid extra penalties: [kredt.be/3u9CoOh]"
+                    )
+                },
+            },
+        )
+        assert response.status_code == 200
+        body = response.json()
+        signals = {e["signal"] for e in body["evidence"]}
+        assert "FEE_OR_FINE_SCAM" in signals
+        assert "URGENT_PAYMENT" in signals
+        assert "SHORTENED_LINK" in signals
+        # Previously scored 15 (LOW). Must now clear UNCERTAIN at minimum.
+        assert body["risk"]["score"] >= 25
+        assert body["risk"]["band"] != "LOW"

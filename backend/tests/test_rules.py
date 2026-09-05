@@ -144,3 +144,23 @@ class TestRuleCombinations:
         assert result.score <= 45
         assert result.band in ("UNCERTAIN", "MEDIUM")
         assert result.band != "HIGH"
+
+
+class TestFeeOrFineRule:
+    def test_unpaid_toll_fee_matches(self) -> None:
+        text = "Alert: You have an unpaid toll fee of $3.25. Pay immediately to avoid extra penalties."
+        evidence = run_all_rules(text)
+        signals = [e.signal for e in evidence]
+        assert "FEE_OR_FINE_SCAM" in signals
+        assert "URGENT_PAYMENT" in signals
+
+    def test_overdue_invoice_matches(self) -> None:
+        text = "Your invoice is overdue, please settle it now."
+        evidence = run_all_rules(text)
+        signals = [e.signal for e in evidence]
+        assert "FEE_OR_FINE_SCAM" in signals
+
+    def test_legitimate_receipt_does_not_match(self) -> None:
+        text = "Rs 500 sent successfully to Ravi through UPI. Reference 123456789."
+        evidence = run_all_rules(text)
+        assert evidence == []

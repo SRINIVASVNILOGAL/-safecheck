@@ -30,6 +30,10 @@ Category caps sum to exactly 100, so no single category can saturate the score o
 
 Document-analysis evidence (claim extraction, official-source verification, fee/deadline mismatches) contributes through `Rule_points`. It does not get a separate category in this version.
 
+### 2.1 Embedded links in pasted TEXT/EMAIL content
+
+A pasted TEXT message or EMAIL body is scanned for embedded links (both `https://...` links and scheme-less links like `kredt.be/3u9CoOh`, which real scam SMS commonly use), and each extracted link is run through the same local URL rules plus Google Safe Browsing/VirusTotal as a direct URL submission (`app.analyzers.text_url_extraction.extract_urls_from_text`, wired into `app.graph.nodes.extract_evidence`). Their `category="url"` evidence merges with the message's `category="rules"` evidence before one `calculate_risk()` call — this closes a gap where a fraudulent message's own link was previously invisible to URL analysis. Bounded to 5 unique links per message, matching the Gmail Email Agent's existing per-message URL limit.
+
 ## 3. Risk bands (4-band, matches Android)
 
 ```typescript
